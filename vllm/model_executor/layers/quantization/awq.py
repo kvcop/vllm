@@ -103,6 +103,23 @@ class AWQConfig(QuantizationConfig):
                 skip_with_substr=True,
             ):
                 return UnquantizedLinearMethod()
+
+            # Lazy import to avoid circular import.
+            from .awq_marlin import AWQMarlinConfig, AWQMarlinLinearMethod
+            from .utils.marlin_utils import check_marlin_supports_layer
+
+            # Check if the layer is supported by AWQMarlin.
+            if check_marlin_supports_layer(layer, self.group_size):
+                awq_marlin_config = AWQMarlinConfig(
+                    weight_bits=self.weight_bits,
+                    group_size=self.group_size,
+                    zero_point=self.zero_point,
+                    lm_head_quantized=False,
+                    modules_to_not_convert=self.modules_to_not_convert,
+                    full_config={},
+                )
+                return AWQMarlinLinearMethod(awq_marlin_config)
+
             return AWQLinearMethod(self)
         elif isinstance(layer, FusedMoE):
             # Lazy import to avoid circular import.

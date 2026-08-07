@@ -50,6 +50,28 @@ def test_sort_batch_req_ids_spec_decode():
     assert sort_batch_req_ids(num_tokens_per_req, {}, 2) == ["d1", "d2", "tail", "p1"]
 
 
+def test_adaptive_verification_requests_lead_priority_insertion_order():
+    # A priority scheduler may insert prefill/decode requests before verification
+    # requests. Adaptive compaction requires every request with drafts to remain
+    # a contiguous leading group after model-runner sorting.
+    num_tokens_per_req = {
+        "priority-prefill": 40,
+        "plain-decode": 1,
+        "verify-long": 9,
+        "verify-short": 2,
+    }
+    draft_tokens = {
+        "verify-long": list(range(8)),
+        "verify-short": [0],
+    }
+
+    req_ids = sort_batch_req_ids(num_tokens_per_req, draft_tokens, 9)
+
+    assert set(req_ids[:2]) == {"verify-short", "verify-long"}
+    assert all(draft_tokens.get(req_id) for req_id in req_ids[:2])
+    assert not any(draft_tokens.get(req_id) for req_id in req_ids[2:])
+
+
 def test_spec_decodes_lead_short_prefill_tail():
     # With the fixed ordering, split_decodes_and_prefills classifies the
     # uniform 2-token decodes as decodes even when a 1-token prefill tail is

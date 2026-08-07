@@ -376,12 +376,12 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.bias(markov_embed, self.logits_processor)
 
-    def compute_confidence(
+    def compute_confidence_logits(
         self, head_hidden: torch.Tensor, markov_embed: torch.Tensor
     ) -> torch.Tensor:
-        """Per-position acceptance probability for each drafted token."""
+        """Uncalibrated per-position acceptance logits for drafted tokens."""
         assert self.model.confidence_head is not None
-        return torch.sigmoid(self.model.confidence_head(head_hidden, markov_embed))
+        return self.model.confidence_head(head_hidden, markov_embed)
 
     # --- Weight loading ----------------------------------------------------
 

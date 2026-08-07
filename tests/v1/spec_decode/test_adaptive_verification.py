@@ -4,11 +4,90 @@
 from types import SimpleNamespace
 
 import numpy as np
+import torch
 
 from vllm.v1.worker.gpu.async_utils import StepTimingSample
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     AdaptiveVerificationManager,
+    _assign_draft_token_budget,
 )
+from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
+    DSparkSpeculator,
+    _calibrate_confidence_logits,
+)
+
+
+def test_confidence_temperature_calibrates_request_major_draft_positions():
+    logits = torch.tensor([[0.0, 2.0], [-2.0, 4.0]], dtype=torch.float16)
+    temperatures = torch.tensor([[1.0, 2.0]], dtype=torch.float32)
+
+    actual = _calibrate_confidence_logits(logits, temperatures)
+
+    expected = torch.sigmoid(
+        torch.tensor([[0.0, 1.0], [-2.0, 2.0]], dtype=torch.float32)
+    )
+    torch.testing.assert_close(actual, expected)
+    assert actual.dtype == torch.float32
+
+
+def test_record_confidence_restores_request_major_step_layout():
+    class PositionCodedConfidenceModel:
+        def compute_confidence_logits(self, head_hidden, markov_embed):
+            torch.testing.assert_close(
+                markov_embed.squeeze(-1),
+                torch.tensor([0.0, 1.0, 2.0, 10.0, 11.0, 12.0]),
+            )
+            return head_hidden.squeeze(-1)
+
+    speculator = DSparkSpeculator.__new__(DSparkSpeculator)
+    speculator.num_speculative_steps = 3
+    speculator.model = PositionCodedConfidenceModel()
+    speculator._confidence_temperatures = torch.tensor([[1.0, 2.0, 4.0]])
+    speculator.draft_token_confidence_probs = torch.empty((2, 3))
+    head_hidden = torch.tensor([[0.0], [2.0], [4.0], [10.0], [20.0], [40.0]])
+    markov_by_step = [
+        torch.tensor([[float(step)], [float(10 + step)]]) for step in range(3)
+    ]
+
+    speculator._record_confidence_probs(2, head_hidden, markov_by_step)
+
+    expected = torch.sigmoid(torch.tensor([[0.0, 1.0, 1.0], [10.0, 10.0, 10.0]]))
+    torch.testing.assert_close(speculator.draft_token_confidence_probs, expected)
+
+
+def test_equal_survival_budget_is_stable_and_prefers_shallow_steps():
+    confidences = torch.ones((3, 3), dtype=torch.float32)
+    idx_mapping = torch.arange(3)
+    expected = torch.tensor([2, 1, 1], dtype=torch.int32)
+
+    for _ in range(3):
+        capacities = torch.tensor([3, 3, 3], dtype=torch.int32)
+        _assign_draft_token_budget(
+            confidences,
+            idx_mapping,
+            capacities,
+            draft_budget=4,
+            num_steps=3,
+        )
+        torch.testing.assert_close(capacities, expected)
+
+
+def test_uneven_logical_lengths_preserve_bounds_and_total_budget():
+    confidences = torch.ones((3, 8), dtype=torch.float32)
+    capacities = torch.tensor([0, 1, 8], dtype=torch.int32)
+
+    _assign_draft_token_budget(
+        confidences,
+        torch.arange(3),
+        capacities,
+        draft_budget=5,
+        num_steps=8,
+    )
+
+    # The zero-length request remains empty, the one-token request cannot grow,
+    # and the remaining budget is a contiguous prefix of the third request.
+    torch.testing.assert_close(capacities, torch.tensor([0, 1, 4], dtype=torch.int32))
+    assert int(capacities.sum()) == 5
 
 
 def make_manager(

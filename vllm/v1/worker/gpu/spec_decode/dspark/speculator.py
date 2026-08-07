@@ -37,6 +37,19 @@ from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
 logger = init_logger(__name__)
 
 
+def _calibrate_confidence_logits(
+    logits: torch.Tensor, temperatures: torch.Tensor
+) -> torch.Tensor:
+    """Calibrate request-major confidence logits by draft position.
+
+    ``logits`` is ``[num_reqs, num_speculative_steps]`` and ``temperatures``
+    is the persistent ``[1, num_speculative_steps]`` STS schedule. This
+    temperature is specific to confidence calibration; it must never be reused
+    for proposal sampling or rejection sampling.
+    """
+    return torch.sigmoid(logits.float() / temperatures)
+
+
 class DSparkSpeculator(DFlashSpeculator):
     _speculator_name = "DSpark"
 
@@ -84,6 +97,41 @@ class DSparkSpeculator(DFlashSpeculator):
         )
         self.enable_adaptive_verification = (
             self.speculative_config.enable_adaptive_verification
+        )
+        confidence_temperatures = self.speculative_config.dspark_confidence_temperatures
+        if confidence_temperatures is None:
+            confidence_temperatures = [1.0] * self.num_speculative_steps
+        confidence_temperatures_tuple = tuple(confidence_temperatures)
+        calibration_mode = (
+            "raw_identity"
+            if all(temperature == 1.0 for temperature in confidence_temperatures_tuple)
+            else "sts_calibrated"
+        )
+        logger.info_once(
+            "DSpark confidence calibration mode=%s temperatures=%s",
+            calibration_mode,
+            confidence_temperatures_tuple,
+        )
+        # Keep this fixed-shape buffer alive for CUDA graph replay. The request
+        # dimension broadcasts only after flat confidence logits are restored
+        # to their request-major [R, K] layout.
+        self._confidence_temperatures = torch.tensor(
+            confidence_temperatures_tuple, dtype=torch.float32, device=device
+        ).view(1, self.num_speculative_steps)
+
+    def _record_confidence_probs(
+        self,
+        num_reqs: int,
+        sample_hidden: torch.Tensor,
+        confidence_markov_embeds: list[torch.Tensor],
+    ) -> None:
+        n_spec = self.num_speculative_steps
+        confidence_logits = self.model.compute_confidence_logits(
+            sample_hidden,
+            torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
+        ).view(num_reqs, n_spec)
+        self.draft_token_confidence_probs[:num_reqs] = _calibrate_confidence_logits(
+            confidence_logits, self._confidence_temperatures
         )
 
     def load_draft_model(
@@ -186,12 +234,8 @@ class DSparkSpeculator(DFlashSpeculator):
             prev = draft_sampled_i
 
         if self.enable_adaptive_verification:
-            confidence = self.model.compute_confidence(
-                sample_hidden,
-                torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
-            )
-            self.draft_token_confidence_probs[:num_reqs] = confidence.view(
-                num_reqs, n_spec
+            self._record_confidence_probs(
+                num_reqs, sample_hidden, confidence_markov_embeds
             )
 
     def _sample_sequential_topk(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
@@ -235,12 +279,8 @@ class DSparkSpeculator(DFlashSpeculator):
             prev = draft_sampled_i
 
         if self.enable_adaptive_verification:
-            confidence = self.model.compute_confidence(
-                sample_hidden,
-                torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
-            )
-            self.draft_token_confidence_probs[:num_reqs] = confidence.view(
-                num_reqs, n_spec
+            self._record_confidence_probs(
+                num_reqs, sample_hidden, confidence_markov_embeds
             )
 
     def _generate_draft(

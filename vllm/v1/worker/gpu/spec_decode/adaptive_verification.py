@@ -48,10 +48,19 @@ def _assign_draft_token_budget(
     # Out-of-range slots score -inf so they never outrank a real draft.
     out_of_range = steps[None, :] >= capacities[:, None]
     survival = survival.masked_fill(out_of_range, -float("inf"))
-    flat = survival.flatten()
-    winners = flat.topk(draft_budget).indices
+    # Sort step-major and stably so exact ties prefer the shallower draft
+    # position, then the existing batch order. Ties are common after a request
+    # reset, when every confidence is one. This changes no score ordering; it
+    # only makes the otherwise backend-dependent top-k tie-break reproducible.
+    flat = survival.transpose(0, 1).flatten()
+    winners = torch.argsort(flat, descending=True, stable=True)[:draft_budget]
     admitted = torch.zeros_like(flat, dtype=torch.bool).index_fill_(0, winners, True)
-    torch.sum(admitted.view_as(survival), dim=1, dtype=capacities.dtype, out=capacities)
+    torch.sum(
+        admitted.view(num_steps, -1),
+        dim=0,
+        dtype=capacities.dtype,
+        out=capacities,
+    )
 
 
 _assign_draft_token_budget_compiled = torch.compile(

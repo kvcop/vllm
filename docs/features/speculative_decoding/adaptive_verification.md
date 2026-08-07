@@ -32,7 +32,19 @@ vllm serve deepseek-ai/DeepSeek-V4-Flash-DSpark \
 
 Set `enable_adaptive_verification: false` to verify the full block for every request.
 
-`num_speculative_tokens` must be at least the checkpoint's block size (`dspark_block_size`, e.g. 7 for DeepSeek-V4-Flash); smaller values feed the block machinery a layout it was not trained for and are rejected at startup.
+For DSV4-style checkpoints, `num_speculative_tokens` must be at least the checkpoint's `dspark_block_size` (for example, 7 for DeepSeek-V4-Flash). For Qwen3 DSpark checkpoints in speculators format, it must equal `block_size` when `sample_from_anchor=true`; legacy checkpoints with `sample_from_anchor=false` use the anchor as a bonus token and require `block_size - 1`. Their Markov head was trained for that fixed semi-autoregressive layout. Both contracts are validated at startup.
+
+### Confidence calibration
+
+`dspark_confidence_temperatures` optionally supplies one positive, finite temperature per speculative position. vLLM applies it only to the confidence logit before the sigmoid, `sigmoid(logit / temperature[position])`; it never changes proposal sampling or rejection-sampling temperatures. Omit the option (the default) to use the checkpoint's raw confidence scores. An identity vector is useful only as a raw-confidence diagnostic:
+
+```json
+"dspark_confidence_temperatures": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+```
+
+Use calibrated values only after fitting them from held-out left-to-right sequential temperature scaling (STS) data with the same target, draft, and sampling configuration.
+
+The production scheduler uses confidence scores from exactly two decode steps earlier (`t−2`) to select the next global verification budget. This preserves a fixed captured graph for the current target forward; it is distinct from the paper's synchronous all-candidate allocation algorithm.
 
 ## Requirements and limitations
 

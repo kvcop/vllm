@@ -3,6 +3,7 @@
 
 import copy
 import functools
+import math
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
@@ -297,6 +298,15 @@ class SpeculativeConfig:
     dspark_draft_topk: int | None = Field(default=None, ge=1)
     """For Qwen3 DSpark drafting, evaluate the Markov projection only for the
     top-k base-logit candidates. Requires draft tensor parallel size 1."""
+
+    dspark_confidence_temperatures: list[float] | None = None
+    """Optional per-position confidence-logit temperatures for DSpark.
+
+    The list must contain exactly one finite positive temperature for every
+    speculative position. ``None`` leaves confidence logits uncalibrated.
+    Temperatures are applied after the draft model's final hidden states, so
+    they deliberately do not contribute to :meth:`compute_hash`.
+    """
 
     def compute_hash(self) -> str:
         """
@@ -1078,25 +1088,52 @@ class SpeculativeConfig:
                     # layout and yields incorrect (garbled) output rather than
                     # merely lower acceptance. Require num_speculative_tokens to
                     # be at least the block size (e.g. 5 or 7 for DeepSeek-V4).
-                    dspark_block_size = getattr(
-                        self.draft_model_config.hf_config,
-                        "dspark_block_size",
-                        None,
-                    )
-                    if (
-                        dspark_block_size is not None
-                        and self.num_speculative_tokens < dspark_block_size
-                    ):
-                        raise ValueError(
-                            "DSpark requires num_speculative_tokens >= "
-                            f"dspark_block_size ({dspark_block_size}); got "
-                            f"{self.num_speculative_tokens}. Smaller values "
-                            "produce incorrect output. Use "
-                            f"num_speculative_tokens={dspark_block_size} or "
-                            "larger (e.g. 7)."
-                        )
-
                     hf_config = self.draft_model_config.hf_config
+                    qwen_dspark_block = (
+                        "Qwen3DSparkModel" in self.draft_model_config.architectures
+                    )
+                    dspark_block_size = getattr(hf_config, "dspark_block_size", None)
+                    if qwen_dspark_block and dspark_block_size is None:
+                        # speculators-format Qwen DSpark checkpoints expose the
+                        # semi-autoregressive block as ``block_size`` rather
+                        # than DSV4's ``dspark_block_size``.
+                        dspark_block_size = getattr(hf_config, "block_size", None)
+                    if dspark_block_size is not None:
+                        if qwen_dspark_block:
+                            # Legacy speculators-format checkpoints treat the
+                            # anchor as the bonus token, leaving block_size - 1
+                            # mask positions to draft.
+                            sample_from_anchor = getattr(
+                                hf_config, "sample_from_anchor", True
+                            )
+                            required_drafts = dspark_block_size - int(
+                                not sample_from_anchor
+                            )
+                            block_size_is_invalid = (
+                                self.num_speculative_tokens != required_drafts
+                            )
+                            requirement = "exactly"
+                            suggestion = (
+                                f"Set num_speculative_tokens={required_drafts}."
+                            )
+                        else:
+                            required_drafts = dspark_block_size
+                            block_size_is_invalid = (
+                                self.num_speculative_tokens < required_drafts
+                            )
+                            requirement = "at least"
+                            suggestion = (
+                                f"Use num_speculative_tokens={required_drafts} "
+                                "or larger."
+                            )
+                        if block_size_is_invalid:
+                            raise ValueError(
+                                "DSpark requires num_speculative_tokens "
+                                f"{requirement} {required_drafts}; got "
+                                f"{self.num_speculative_tokens}. An incompatible "
+                                f"value produces incorrect output. {suggestion}"
+                            )
+
                     dspark_draft_topk = self.dspark_draft_topk
                     if dspark_draft_topk is None:
                         dspark_draft_topk = getattr(
@@ -1383,6 +1420,26 @@ class SpeculativeConfig:
                 "synthetic_acceptance_rates / synthetic_acceptance_length "
                 "are only valid with rejection_sample_method='synthetic'."
             )
+
+        if self.dspark_confidence_temperatures is not None:
+            if self.method != "dspark":
+                raise ValueError(
+                    "dspark_confidence_temperatures is only supported by DSpark"
+                )
+            if len(self.dspark_confidence_temperatures) != self.num_speculative_tokens:
+                raise ValueError(
+                    "dspark_confidence_temperatures must have length "
+                    f"{self.num_speculative_tokens}, got "
+                    f"{self.dspark_confidence_temperatures}."
+                )
+            if not all(
+                math.isfinite(temperature) and temperature > 0.0
+                for temperature in self.dspark_confidence_temperatures
+            ):
+                raise ValueError(
+                    "dspark_confidence_temperatures entries must be finite and "
+                    f"positive, got {self.dspark_confidence_temperatures}."
+                )
 
         if self.draft_model_config:
             self.draft_model_config.verify_with_parallel_config(

@@ -119,6 +119,19 @@ GDN_BUILD_TEST_CASES = {
         expected_num_prefill_tokens=1,
         expected_num_spec_decodes=1,
     ),
+    # Adaptive verification may assign different exact capacities per row.
+    # GDN must classify both shortened rows as spec decodes from the exact
+    # CPU draft lengths rather than assuming one uniform query length.
+    "adaptive_varlen_spec_decode": GDNBuildTestCase(
+        seq_lens=[65, 20, 30],
+        query_lens=[1, 2, 4],
+        num_decode_draft_tokens=[-1, 1, 3],
+        num_speculative_tokens=8,
+        expected_num_decodes=0,
+        expected_num_prefills=1,
+        expected_num_prefill_tokens=1,
+        expected_num_spec_decodes=2,
+    ),
 }
 
 

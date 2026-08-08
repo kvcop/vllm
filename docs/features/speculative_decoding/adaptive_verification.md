@@ -44,7 +44,7 @@ For DSV4-style checkpoints, `num_speculative_tokens` must be at least the checkp
 
 Use calibrated values only after fitting them from held-out left-to-right sequential temperature scaling (STS) data with the same target, draft, and sampling configuration.
 
-The production scheduler uses confidence scores from exactly two decode steps earlier (`t−2`) to select the next global verification budget. This preserves a fixed captured graph for the current target forward; it is distinct from the paper's synchronous all-candidate allocation algorithm.
+The production scheduler uses confidence scores from exactly two decode steps earlier (`t−2`) to select the next global verification budget. Current GPU confidence then ranks the candidate slots within that fixed budget. The resulting per-request capacities are copied to the CPU before attention metadata is built, so the CPU and device use the same exact query layout. This two-step procedure is distinct from the paper's synchronous all-candidate allocation algorithm.
 
 ### Collecting calibration data
 
@@ -80,8 +80,9 @@ Startup warm-up requests are excluded from capture. Do not combine calibration c
 
 ## Requirements and limitations
 
-- The attention backend must tolerate device-decided query lengths, since the CPU lengths only bound them from above. Backends that plan off the CPU lengths are excluded by the attention selector, and rejected at startup for models that hard-wire their backend.
-- Full cudagraphs are required: step costs are profiled from captured graphs, so `--enforce-eager` is rejected at startup.
+- Adaptive variable-length FULL graphs require every target attention group to report `ALWAYS` cudagraph support. Mixed models with a more restrictive group, such as Qwen GDN, use PIECEWISE target execution while the DSpark drafter remains independently eligible for FULL graphs.
+- FlashInfer remains conservatively excluded from adaptive verification until its variable-length metadata path is validated with the exact synchronized layout.
+- Startup graph capture is required to profile step costs. Explicit `cudagraph_mode=NONE` and `--enforce-eager` are rejected at startup; PIECEWISE target capture is supported.
 - Not supported with LoRA (the per-token LoRA mapping is built from CPU-side boundaries), pipeline parallelism (cost curves and confidences exist only on the last rank), or output logprobs (to be fixed).
 
 ## Tuning the cost profile

@@ -392,7 +392,12 @@ class CudaGraphManager:
     def captured_token_counts(self) -> list[int]:
         """Sorted token counts with a captured graph, ignoring LoRA variants."""
         return sorted(
-            {desc.num_tokens for desc in self.graphs if desc.num_active_loras == 0}
+            {
+                desc.num_tokens
+                for descs in self._capture_descs.values()
+                for desc in descs
+                if desc.num_active_loras == 0
+            }
         )
 
     def dispatch(

@@ -4,12 +4,21 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
+import vllm.v1.worker.gpu.spec_decode.adaptive_verification as adaptive_module
+from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.worker.gpu.async_utils import StepTimingSample
+from vllm.v1.worker.gpu.attn_utils import AttentionCGSupportInfo
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     AdaptiveVerificationManager,
     _assign_draft_token_budget,
+    build_cost_tables_from_curves,
+    build_exact_adaptive_layout,
+    get_adaptive_speculator_cudagraph_mode,
+    get_adaptive_verification_cudagraph_mode,
 )
 from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
     DSparkSpeculator,
@@ -105,6 +114,94 @@ def test_uneven_logical_lengths_preserve_bounds_and_total_budget():
     assert int(capacities.sum()) == 5
 
 
+@pytest.mark.parametrize(
+    "support, expected",
+    [
+        (AttentionCGSupport.ALWAYS, CUDAGraphMode.FULL_AND_PIECEWISE),
+        (AttentionCGSupport.UNIFORM_BATCH, CUDAGraphMode.PIECEWISE),
+        (AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE, CUDAGraphMode.PIECEWISE),
+        (AttentionCGSupport.NEVER, CUDAGraphMode.PIECEWISE),
+    ],
+)
+def test_adaptive_varlen_full_requires_always_attention_support(support, expected):
+    assert (
+        get_adaptive_verification_cudagraph_mode(
+            CUDAGraphMode.FULL, support, enabled=True
+        )
+        == expected
+    )
+
+
+def test_adaptive_policy_uses_most_restrictive_attention_group():
+    support = AttentionCGSupportInfo().narrow(
+        AttentionCGSupport.ALWAYS, "TritonAttentionBackend"
+    )
+    support = support.narrow(AttentionCGSupport.UNIFORM_BATCH, "GDNAttentionBackend")
+
+    assert support.min_cg_attn_backend == "GDNAttentionBackend"
+    assert (
+        get_adaptive_verification_cudagraph_mode(
+            CUDAGraphMode.FULL,
+            support.min_cg_support,
+            enabled=True,
+        )
+        == CUDAGraphMode.PIECEWISE
+    )
+
+
+def test_adaptive_off_preserves_configured_cudagraph_mode():
+    assert (
+        get_adaptive_verification_cudagraph_mode(
+            CUDAGraphMode.FULL_DECODE_ONLY,
+            AttentionCGSupport.UNIFORM_BATCH,
+            enabled=False,
+        )
+        == CUDAGraphMode.FULL_DECODE_ONLY
+    )
+
+
+@pytest.mark.parametrize(
+    "configured_mode, enforce_eager",
+    [
+        (None, False),
+        (CUDAGraphMode.NONE, False),
+        (CUDAGraphMode.FULL_AND_PIECEWISE, True),
+    ],
+)
+def test_adaptive_rejects_modes_without_startup_cost_profiling(
+    configured_mode, enforce_eager
+):
+    with pytest.raises(ValueError, match="startup cost profiling"):
+        get_adaptive_verification_cudagraph_mode(
+            configured_mode,
+            AttentionCGSupport.ALWAYS,
+            enabled=True,
+            enforce_eager=enforce_eager,
+        )
+
+
+def test_target_piecewise_fallback_keeps_speculator_full_eligible():
+    assert (
+        get_adaptive_speculator_cudagraph_mode(CUDAGraphMode.PIECEWISE, enabled=True)
+        == CUDAGraphMode.FULL_AND_PIECEWISE
+    )
+    assert (
+        get_adaptive_speculator_cudagraph_mode(CUDAGraphMode.PIECEWISE, enabled=False)
+        == CUDAGraphMode.PIECEWISE
+    )
+
+
+@pytest.mark.parametrize("bad_cost", [float("nan"), float("inf"), -float("inf")])
+def test_cost_tables_reject_non_finite_profile_samples(bad_cost):
+    with pytest.raises(ValueError, match="finite"):
+        build_cost_tables_from_curves(
+            [(1, 1.0)],
+            [(1, bad_cost)],
+            max_num_reqs=2,
+            max_batch_tokens=2,
+        )
+
+
 def make_manager(
     confidences: np.ndarray, verify_cost_ms: np.ndarray
 ) -> AdaptiveVerificationManager:
@@ -180,29 +277,77 @@ def test_profiled_batches_seed_cost_curves_via_consumer():
     assert curves["draft"] == [(1, 1.0), (128, 1.0)]
 
 
-def test_compact_batch_preserves_totals_and_bounds():
-    # The CPU placeholder layout must keep the batch total equal to the GPU
-    # total and every verification row within decode_query_len, or downstream
-    # CPU metadata desyncs from the reallocated GPU boundaries.
+def test_current_gpu_allocation_returns_exact_cpu_layout(monkeypatch):
+    # t-2 confidence sizes the global budget, while current GPU confidence
+    # decides which request receives it. The returned CPU capacities become
+    # the source of truth for all attention and sampler layout fields.
     manager = make_manager(
-        np.array([[0.9, 0.9], [0.9, 0.9], [1.0, 1.0]], dtype=np.float32),
-        np.array([1.0] * 44 + [100.0] * 3),
+        np.array([[0.1, 0.1], [0.9, 0.9]], dtype=np.float32),
+        np.array([1.0, 1.0, 1.0, 1.0, 100.0, 100.0, 100.0]),
     )
-    manager.req_states.req_id_to_index["prefill"] = 2
-    manager.req_states.num_computed_tokens_np = np.zeros(3, dtype=np.int32)
-    manager.req_states.prefill_len.np = np.array([0, 0, 60], dtype=np.int32)
+    manager._confidence_probs = torch.tensor(
+        [[0.99, 0.99], [0.01, 0.01]], dtype=torch.float32
+    )
+
+    class CapacityBuffer:
+        def __init__(self):
+            self.gpu = torch.zeros(2, dtype=torch.int32)
+            self.np = np.zeros(2, dtype=np.int32)
+
+        def copy_to_cpu(self, n):
+            self.np[:n] = self.gpu[:n].numpy()
+
+    class CopyEvent:
+        def record(self):
+            pass
+
+        def synchronize(self):
+            pass
+
+    manager._batch_draft_capacity = CapacityBuffer()
+    manager._capacity_copy_event = CopyEvent()
+    monkeypatch.setattr(
+        adaptive_module,
+        "_assign_draft_token_budget_compiled",
+        _assign_draft_token_budget,
+    )
+    monkeypatch.setattr(
+        adaptive_module,
+        "async_copy_to_gpu",
+        lambda values, out: out.copy_(torch.from_numpy(values)),
+    )
+
     num_tokens = manager.get_num_tokens(
-        {"low": 3, "high": 3, "prefill": 40},
+        {"low": 3, "high": 3},
         {"low": [1, 2], "high": [3, 4]},
     )
-    scheduled = np.array([3, 3, 40], dtype=np.int32)
-    drafts = np.array([2, 2, 0], dtype=np.int32)
-    compacted = manager.compact_batch(drafts, scheduled)
+    capacities = manager.allocate_drafts(["low", "high"], torch.arange(2))
+    exact_scheduled, exact_cu_num_logits = build_exact_adaptive_layout(
+        np.array([3, 3], dtype=np.int32),
+        np.array([2, 2], dtype=np.int32),
+        capacities,
+        num_bonus_tokens=1,
+    )
 
-    assert int(compacted.sum()) == num_tokens
-    num_steps = manager.num_speculative_steps
-    assert (compacted[:2] <= 1 + num_steps).all()
-    assert compacted[2] == 40
+    assert num_tokens == 3
+    np.testing.assert_array_equal(capacities, [1, 0])
+    np.testing.assert_array_equal(exact_scheduled, [2, 1])
+    np.testing.assert_array_equal(exact_cu_num_logits, [0, 2, 3])
+    assert int(exact_scheduled.sum()) == num_tokens
+
+
+def test_empty_cost_curves_fail_loudly(monkeypatch):
+    manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
+    manager.req_states = SimpleNamespace(max_num_reqs=2, max_num_batched_tokens=8)
+    manager._cudagraph_limit = 0
+    monkeypatch.setattr(
+        adaptive_module,
+        "get_tp_group",
+        lambda: SimpleNamespace(broadcast_object=lambda value, src: value),
+    )
+
+    with pytest.raises(ValueError, match="non-empty"):
+        manager.set_cost_curves([], [(1, 1.0)])
 
 
 def test_budget_caps_at_one_rejection_sampler_chunk():

@@ -10,9 +10,11 @@ import numpy as np
 import torch
 
 import vllm.envs as envs
+from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import init_logger
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
+from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu.async_utils import StepTimingSample, stream
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
@@ -25,6 +27,56 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu.states import RequestState
 
 
+def get_adaptive_verification_cudagraph_mode(
+    configured_mode: CUDAGraphMode | None,
+    attention_support: AttentionCGSupport,
+    enabled: bool,
+    enforce_eager: bool = False,
+) -> CUDAGraphMode | None:
+    """Choose a CUDA graph mode that is safe for variable draft lengths."""
+    if not enabled:
+        return configured_mode
+    if enforce_eager or configured_mode in (None, CUDAGraphMode.NONE):
+        raise ValueError(
+            "Adaptive verification requires startup cost profiling and cannot "
+            "run with --enforce-eager or cudagraph_mode=NONE. Use PIECEWISE or "
+            "a FULL CUDA graph mode."
+        )
+    if attention_support == AttentionCGSupport.ALWAYS:
+        return CUDAGraphMode.FULL_AND_PIECEWISE
+    return CUDAGraphMode.PIECEWISE
+
+
+def get_adaptive_speculator_cudagraph_mode(
+    target_mode: CUDAGraphMode,
+    enabled: bool,
+) -> CUDAGraphMode:
+    """Keep the draft eligible for FULL graphs when the target falls back."""
+    if enabled:
+        return CUDAGraphMode.FULL_AND_PIECEWISE
+    return target_mode
+
+
+def build_exact_adaptive_layout(
+    scheduled_tokens: np.ndarray,
+    scheduled_drafts: np.ndarray,
+    admitted_drafts: np.ndarray,
+    num_bonus_tokens: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build exact per-request query lengths and cumulative logit offsets."""
+    if not (scheduled_tokens.shape == scheduled_drafts.shape == admitted_drafts.shape):
+        raise ValueError("Adaptive layout arrays must have the same shape.")
+    if np.any(admitted_drafts < 0) or np.any(admitted_drafts > scheduled_drafts):
+        raise ValueError("Adaptive draft capacities exceed the scheduled drafts.")
+    exact_scheduled_tokens = (
+        scheduled_tokens - scheduled_drafts + admitted_drafts
+    ).astype(np.int32, copy=False)
+    cu_num_logits = np.empty(len(admitted_drafts) + 1, dtype=np.int32)
+    cu_num_logits[0] = 0
+    np.cumsum(admitted_drafts + num_bonus_tokens, out=cu_num_logits[1:])
+    return exact_scheduled_tokens, cu_num_logits
+
+
 def _assign_draft_token_budget(
     confidence_probs: torch.Tensor,
     idx_mapping: torch.Tensor,
@@ -32,26 +84,22 @@ def _assign_draft_token_budget(
     draft_budget: int,
     num_steps: int,
 ) -> None:
-    """Admit the globally best `draft_budget` draft slots, in place.
+    """Admit the globally best ``draft_budget`` current-confidence slots.
 
     Every (request, step) slot is scored by its survival probability, the running
     product of that request's per-position confidences, and the highest scores win.
     Survival only decreases along a request, so a global top-k always admits
     continuously along steps with a request.
 
-    `capacities` enters holding each request's scheduled draft count (which bounds its
-    eligible slots) and leaves holding the admitted count. The caller only calls this
-    when `draft_budget < capacities.sum()`, so every winner is a real draft slot.
+    Stable step-major ordering makes exact ties prefer a shallower step, then
+    the existing request order. Budget sizing intentionally uses the t-2 CPU
+    snapshot, while this allocation uses the current GPU confidences.
     """
     survival = confidence_probs[idx_mapping].cumprod(dim=1)
     steps = torch.arange(num_steps, device=survival.device)
     # Out-of-range slots score -inf so they never outrank a real draft.
     out_of_range = steps[None, :] >= capacities[:, None]
     survival = survival.masked_fill(out_of_range, -float("inf"))
-    # Sort step-major and stably so exact ties prefer the shallower draft
-    # position, then the existing batch order. Ties are common after a request
-    # reset, when every confidence is one. This changes no score ordering; it
-    # only makes the otherwise backend-dependent top-k tie-break reproducible.
     flat = survival.transpose(0, 1).flatten()
     winners = torch.argsort(flat, descending=True, stable=True)[:draft_budget]
     admitted = torch.zeros_like(flat, dtype=torch.bool).index_fill_(0, winners, True)
@@ -85,6 +133,8 @@ def build_cost_tables_from_curves(
 
     def build_table(limit: int, curve: list[tuple[int, float]]) -> np.ndarray:
         xs, ys = np.asarray(curve, dtype=np.float64).T
+        if not np.isfinite(xs).all() or not np.isfinite(ys).all():
+            raise ValueError("DSpark cost curves must contain only finite values.")
         ys = np.maximum.accumulate(ys)
         values = np.arange(limit + 1)
         # Execution pads to the next captured size, so cost is a step
@@ -111,6 +161,8 @@ def build_cost_tables_from_curves(
 
     draft_table = np.maximum(build_table(max_num_reqs, draft_curve), 0.0)
     verify_table = np.maximum(build_table(max_batch_tokens, verify_curve), 1e-6)
+    if not np.isfinite(draft_table).all() or not np.isfinite(verify_table).all():
+        raise ValueError("DSpark generated cost tables must be finite.")
     return draft_table, verify_table
 
 
@@ -118,7 +170,6 @@ class AdaptiveVerificationManager:
     def __init__(
         self,
         req_states: "RequestState",
-        query_start_loc: torch.Tensor,
         num_bonus_tokens: int,
         max_total_logits: int,
     ):
@@ -128,11 +179,8 @@ class AdaptiveVerificationManager:
         self._copy_stream = torch.cuda.Stream(device)
 
         self.num_bonus_tokens = num_bonus_tokens
-        # Rejection sampling verifies logits in one contiguous chunk; the
-        # chunked path indexes by scheduled (untrimmed) offsets and cannot
-        # address the compacted layout, so the budget must fit one chunk.
+        # Bound adaptive verification to one rejection-sampler chunk.
         self._max_total_logits = max_total_logits
-        self.query_start_loc = query_start_loc
         self.cost_tables: tuple[np.ndarray, np.ndarray] | None = None
         # Largest cudagraph-captured token count; above it nothing pads.
         self._cudagraph_limit = 0
@@ -144,12 +192,12 @@ class AdaptiveVerificationManager:
             dtype=torch.float32,
             device=device,
         )
-        self._batch_draft_capacity = torch.empty(
-            max_num_reqs, dtype=torch.int32, device=device
+        self._batch_draft_capacity = CpuGpuBuffer(
+            max_num_reqs,
+            dtype=torch.int32,
+            device=device,
         )
-        self._num_non_draft_tokens = torch.empty_like(query_start_loc[:-1])
-        self._cu_num_logits = torch.empty_like(query_start_loc)
-
+        self._capacity_copy_event = torch.cuda.Event(blocking=True)
         # Two D2H slots preserve stale inputs for budget selection.
         self._stale_confidences = [
             CpuGpuBuffer(
@@ -204,15 +252,37 @@ class AdaptiveVerificationManager:
                 grouped[key].append(value)
             return [(k, float(np.median(v))) for k, v in sorted(grouped.items())]
 
-        # Draft curve: eager-target steps inflate drafter timings (the CPU is
-        # still launching kernels, opening gaps between the drafter's events),
-        # and request counts — unlike token counts — collide across execution
-        # modes, so only graph-replay samples may price the draft curve.
+        full_graph_samples = [sample for sample in samples if sample.full_cudagraph]
+        if full_graph_samples:
+            draft_samples = full_graph_samples
+            draft_source = "full-cudagraph"
+        else:
+            # Adaptive varlen FULL graphs are unsafe for backends below ALWAYS
+            # support (notably Qwen GDN). In PIECEWISE mode, use the captured
+            # size range and exclude eager tail shapes whose request counts can
+            # collide with graph-covered points.
+            draft_samples = [
+                sample
+                for sample in samples
+                if not self._cudagraph_limit
+                or sample.num_target_tokens <= self._cudagraph_limit
+            ]
+            draft_source = "piecewise"
         draft_curve = median_curve(
-            (s.num_reqs, s.drafter_ms) for s in samples if s.full_cudagraph
+            (sample.num_reqs, sample.drafter_ms) for sample in draft_samples
         )
         verify_curve = median_curve(
             (s.num_target_tokens, s.forward_ms) for s in samples
+        )
+        logger.info(
+            "DSpark adaptive profile: context_len=%d, cudagraph_limit=%d, "
+            "samples=%d, draft_source=%s, draft_points=%d, verify_points=%d",
+            envs.VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN,
+            self._cudagraph_limit,
+            len(samples),
+            draft_source,
+            len(draft_curve),
+            len(verify_curve),
         )
         self.set_cost_curves(draft_curve, verify_curve)
 
@@ -225,14 +295,21 @@ class AdaptiveVerificationManager:
             (draft_curve, verify_curve), src=0
         )
         if not draft_curve or not verify_curve:
-            logger.warning_once("DSpark could not profile step costs.")
-            return
+            raise ValueError(
+                "DSpark adaptive verification requires non-empty draft and "
+                "verification cost curves."
+            )
         self.cost_tables = build_cost_tables_from_curves(
             draft_curve,
             verify_curve,
             self.req_states.max_num_reqs,
             self.req_states.max_num_batched_tokens,
             self._cudagraph_limit,
+        )
+        logger.info(
+            "DSpark adaptive cost tables ready: draft=%d entries, verify=%d entries",
+            len(self.cost_tables[0]),
+            len(self.cost_tables[1]),
         )
         logger.debug("DSpark cost tables: %s", self.cost_tables)
 
@@ -318,15 +395,23 @@ class AdaptiveVerificationManager:
                 + 1
             ]
         )
-        num_drafts_per_req = {
-            req_id: int(num_drafts)
-            for req_id, num_drafts in zip(req_ids, scheduled_drafts, strict=True)
-        }
         num_non_draft_tokens_per_req = {
             req_id: int(num_tokens)
             for req_id, num_tokens in zip(req_ids, num_non_draft_tokens, strict=True)
         }
         draft_budget = int(np.argmax(num_tokens_to_estimated_accepted_tokens / costs))
+        if draft_budget < int(scheduled_drafts.sum()):
+            logger.info_once(
+                "DSpark adaptive verification reduced scheduled drafts: "
+                "profile_context_len=%d, scheduled=%d, selected=%d",
+                envs.VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN,
+                int(scheduled_drafts.sum()),
+                draft_budget,
+            )
+        num_drafts_per_req = {
+            req_id: int(num_drafts)
+            for req_id, num_drafts in zip(req_ids, scheduled_drafts, strict=True)
+        }
         self._batch_budget = (
             num_drafts_per_req,
             num_non_draft_tokens_per_req,
@@ -334,85 +419,49 @@ class AdaptiveVerificationManager:
         )
         return sum(num_non_draft_tokens_per_req.values()) + draft_budget
 
-    def compact_batch(
-        self,
-        num_draft_tokens_per_req: np.ndarray,
-        num_scheduled_tokens: np.ndarray,
-    ) -> np.ndarray:
-        batch_budget = self._batch_budget
-        assert batch_budget is not None
-        _, _, draft_budget = batch_budget
-        num_drafts = int(num_draft_tokens_per_req.sum())
-        if draft_budget == num_drafts:
-            return num_scheduled_tokens
-
-        num_non_draft_tokens = num_scheduled_tokens - num_draft_tokens_per_req
-        is_verification_request = num_draft_tokens_per_req > 0
-        num_verification_reqs = int(is_verification_request.sum())
-        # sort_batch_req_ids keeps verification requests at the front.
-        assert np.all(is_verification_request[:num_verification_reqs])
-        # for the CPU side buffer we distribute draft tokens evenly
-        draft_lens_cpu = np.zeros_like(num_non_draft_tokens)
-        draft_lens_cpu[:num_verification_reqs] = draft_budget // num_verification_reqs
-        draft_lens_cpu[: draft_budget % num_verification_reqs] += 1
-        return num_non_draft_tokens + draft_lens_cpu
-
-    def reallocate_drafts(
+    def allocate_drafts(
         self, req_ids: list[str], idx_mapping: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+    ) -> np.ndarray:
+        """Allocate the stale-sized budget with current GPU confidences.
+
+        Returns the exact per-request capacities on CPU. The bounded D2H copy
+        is deliberate: attention metadata must see the same query lengths as
+        the device kernels before the forward starts.
+        """
         batch_budget, self._batch_budget = self._batch_budget, None
         assert batch_budget is not None
-        num_drafts_per_req, num_non_draft_tokens_per_req, draft_budget = batch_budget
-        num_reqs = idx_mapping.shape[0]
+        num_drafts_per_req, _, draft_budget = batch_budget
+        num_reqs = len(req_ids)
         scheduled_drafts = np.fromiter(
             (num_drafts_per_req[req_id] for req_id in req_ids),
             dtype=np.int32,
             count=num_reqs,
         )
-        num_non_draft_tokens = np.fromiter(
-            (num_non_draft_tokens_per_req[req_id] for req_id in req_ids),
-            dtype=np.int32,
-            count=num_reqs,
-        )
-        num_tokens = int(num_non_draft_tokens.sum()) + draft_budget
-
-        # Rank draft slots by survival probability and admit the best prefix.
-        # capacities enters holding each request's valid draft count (the kernel
-        # uses it to bound eligible slots) and leaves holding the admitted count.
-        capacities = self._batch_draft_capacity[:num_reqs]
+        capacities = self._batch_draft_capacity.gpu[:num_reqs]
         if draft_budget == 0:
-            capacities.zero_()
-        else:
-            async_copy_to_gpu(scheduled_drafts, out=capacities)
-            if draft_budget < int(scheduled_drafts.sum()):
-                _assign_draft_token_budget_compiled(
-                    self._confidence_probs,
-                    idx_mapping,
-                    capacities,
-                    draft_budget,
-                    self.num_speculative_steps,
-                )
+            return np.zeros(num_reqs, dtype=np.int32)
+        if draft_budget == int(scheduled_drafts.sum()):
+            return scheduled_drafts
 
-        num_non_draft_tokens_gpu = self._num_non_draft_tokens[:num_reqs]
-        async_copy_to_gpu(
-            num_non_draft_tokens,
-            out=num_non_draft_tokens_gpu,
-        )
-        self._cu_num_logits[:1].zero_()
-        torch.cumsum(
-            capacities + self.num_bonus_tokens,
-            dim=0,
-            out=self._cu_num_logits[1 : num_reqs + 1],
-        )
-        self.query_start_loc[:1].zero_()
-        torch.cumsum(
-            capacities + num_non_draft_tokens_gpu,
-            dim=0,
-            out=self.query_start_loc[1 : num_reqs + 1],
-        )
-        self.query_start_loc[num_reqs + 1 :].fill_(num_tokens)
-        return (
-            self._cu_num_logits[: num_reqs + 1],
-            self.query_start_loc,
+        async_copy_to_gpu(scheduled_drafts, out=capacities)
+        _assign_draft_token_budget_compiled(
+            self._confidence_probs,
+            idx_mapping,
+            capacities,
             draft_budget,
+            self.num_speculative_steps,
         )
+        self._batch_draft_capacity.copy_to_cpu(num_reqs)
+        self._capacity_copy_event.record()
+        with gpu_sync_allowed():
+            self._capacity_copy_event.synchronize()
+        admitted_drafts = self._batch_draft_capacity.np[:num_reqs].copy()
+        if np.any(admitted_drafts > scheduled_drafts):
+            raise RuntimeError(
+                "Adaptive verification admitted more drafts than were scheduled."
+            )
+        if int(admitted_drafts.sum()) != draft_budget:
+            raise RuntimeError(
+                "Adaptive verification capacity does not match the selected budget."
+            )
+        return admitted_drafts

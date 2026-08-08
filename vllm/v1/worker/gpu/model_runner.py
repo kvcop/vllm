@@ -128,6 +128,9 @@ from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 from vllm.v1.worker.gpu.spec_decode import init_speculator
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     AdaptiveVerificationManager,
+    build_exact_adaptive_layout,
+    get_adaptive_speculator_cudagraph_mode,
+    get_adaptive_verification_cudagraph_mode,
 )
 from vllm.v1.worker.gpu.spec_decode.dspark.calibration_collector import (
     DSparkCalibrationCollector,
@@ -570,14 +573,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             backend = get_query_lens_mismatch_unsupported_backend(self.attn_groups)
             if backend is not None:
                 raise ValueError(
-                    "Adaptive verification trims verification requests on device, which"
-                    f" the {backend} attention backend does not support. support. Pass "
+                    "Adaptive verification has not been validated with the "
+                    f"{backend} attention backend. Pass "
                     "enable_adaptive_verification=false in the speculative config, or "
                     "use a backend that does."
                 )
             self.adaptive_verification = AdaptiveVerificationManager(
                 self.req_states,
-                self.input_buffers.query_start_loc,
                 self.model_state.num_new_sampled_tokens_per_step,
                 max_total_logits=get_max_chunk_logits(self.vocab_size),
             )
@@ -604,8 +606,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         initialize_mamba_ssu_backend(
             self.vllm_config.mamba_config, self.kv_cache_config
         )
-        if self.adaptive_verification is not None:
-            self.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+        adaptive_cudagraph_mode = get_adaptive_verification_cudagraph_mode(
+            self.compilation_config.cudagraph_mode,
+            attn_cg_support.min_cg_support,
+            self.adaptive_verification is not None,
+            enforce_eager=self.model_config.enforce_eager,
+        )
+        if (
+            self.adaptive_verification is not None
+            and adaptive_cudagraph_mode == CUDAGraphMode.PIECEWISE
+        ):
+            logger.info(
+                "Adaptive verification disables variable-length FULL CUDA "
+                "graphs for %s (support: %s); using PIECEWISE/eager execution.",
+                attn_cg_support.min_cg_attn_backend,
+                attn_cg_support.min_cg_support,
+            )
+        self.compilation_config.cudagraph_mode = adaptive_cudagraph_mode
         cudagraph_mode = self.compilation_config.resolve_cudagraph_mode_and_sizes(
             attn_cg_support.min_cg_support,
             attn_cg_support.min_cg_attn_backend,
@@ -636,7 +653,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.speculator is not None:
             # After set_attn, so the speculator can size its cudagraph mode
             # to its own attention support.
-            self.speculator.init_cudagraph_manager(cudagraph_mode)
+            speculator_cudagraph_mode = get_adaptive_speculator_cudagraph_mode(
+                cudagraph_mode,
+                self.adaptive_verification is not None,
+            )
+            if speculator_cudagraph_mode != cudagraph_mode:
+                logger.info(
+                    "Adaptive verification CUDA graph policy: target=%s, "
+                    "draft_requested=%s; the speculator will resolve against "
+                    "its own attention support.",
+                    cudagraph_mode,
+                    speculator_cudagraph_mode,
+                )
+            self.speculator.init_cudagraph_manager(speculator_cudagraph_mode)
 
         self.kv_caches: list[torch.Tensor] = []
         kv_caches_dict = init_kv_cache(
@@ -1099,6 +1128,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         numtoks_iter = map(num_tokens_per_req.__getitem__, req_ids)
         num_scheduled_tokens = np.fromiter(numtoks_iter, dtype=np.int32, count=num_reqs)
+        original_max_query_len = int(num_scheduled_tokens.max())
 
         idx_mapping_iter = map(self.req_states.req_id_to_index.__getitem__, req_ids)
         idx_mapping_np = np.fromiter(idx_mapping_iter, dtype=np.intp, count=num_reqs)
@@ -1119,31 +1149,43 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_reqs, dtype=torch.int32, device=self.device
             )
         else:
-            num_draft_tokens_per_req = np.fromiter(
+            scheduled_draft_tokens_per_req = np.fromiter(
                 (len(draft_tokens.get(req_id, ())) for req_id in req_ids),
                 dtype=np.int32,
                 count=num_reqs,
             )
+            adaptive_verification = self.adaptive_verification
+            if adaptive_verification is not None:
+                num_draft_tokens_per_req = adaptive_verification.allocate_drafts(
+                    req_ids, idx_mapping
+                )
+                num_scheduled_tokens, cu_num_logits_np = build_exact_adaptive_layout(
+                    num_scheduled_tokens,
+                    scheduled_draft_tokens_per_req,
+                    num_draft_tokens_per_req,
+                    self.model_state.num_new_sampled_tokens_per_step,
+                )
+            else:
+                num_draft_tokens_per_req = scheduled_draft_tokens_per_req
             num_bonus_tokens = self.model_state.num_new_sampled_tokens_per_step
             total_num_draft_tokens = int(num_draft_tokens_per_req.sum())
             total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
-            num_logits = num_draft_tokens_per_req + num_bonus_tokens
-            cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
-            cu_num_logits_np[0] = 0
-            np.cumsum(num_logits, out=cu_num_logits_np[1:])
+            if adaptive_verification is None:
+                num_logits = num_draft_tokens_per_req + num_bonus_tokens
+                cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
+                cu_num_logits_np[0] = 0
+                np.cumsum(num_logits, out=cu_num_logits_np[1:])
             cu_num_logits = async_copy_to_gpu(cu_num_logits_np, device=self.device)
-
-        adaptive_verification = (
-            self.adaptive_verification if num_draft_tokens_per_req is not None else None
-        )
-        scheduled_num_tokens = num_scheduled_tokens
-        if adaptive_verification is not None:
-            # num_scheduled_tokens represents the draft budget evenly distributed across
-            # all verification requests, `reallocate_drafts` will unevenly assign the
-            # draft budget to requests on the GPU side only.
-            num_scheduled_tokens = adaptive_verification.compact_batch(
-                num_draft_tokens_per_req,
-                num_scheduled_tokens,
+        if not draft_tokens:
+            adaptive_verification = None
+        if int(num_scheduled_tokens.sum()) != num_tokens:
+            raise RuntimeError(
+                "Adaptive verification query layout does not match the selected "
+                "token budget."
+            )
+        if int(cu_num_logits_np[-1]) != total_num_logits:
+            raise RuntimeError(
+                "Adaptive verification logit layout does not match its token count."
             )
 
         # Get query_start_loc.
@@ -1157,11 +1199,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         query_start_loc_np[num_reqs + 1 :] = num_tokens
         query_start_loc = self.input_buffers.query_start_loc
         async_copy_to_gpu(query_start_loc_np, out=query_start_loc)
-        if adaptive_verification is not None:
-            cu_num_logits, query_start_loc, total_num_draft_tokens = (
-                adaptive_verification.reallocate_drafts(req_ids, idx_mapping)
-            )
-            total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
         if draft_tokens:
             expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
                 idx_mapping,
@@ -1231,7 +1268,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         seq_lens_cpu_upper_bound_np = np.zeros(num_reqs_padded, dtype=np.int32)
         np.add(
             num_computed_tokens_np,
-            scheduled_num_tokens,
+            num_scheduled_tokens,
             out=seq_lens_cpu_upper_bound_np[:num_reqs],
         )
         seq_lens_cpu_upper_bound = torch.from_numpy(seq_lens_cpu_upper_bound_np)
@@ -1278,9 +1315,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             has_structured_output_reqs=scheduler_output.has_structured_output_requests,
             prompt_lens=prompt_lens,
             max_query_len=(
-                int(scheduled_num_tokens.max())
-                if adaptive_verification is not None
-                else None
+                original_max_query_len if adaptive_verification is not None else None
             ),
         )
         return pcp.maybe_partition_pcp_batch(self.pcp_manager, input_batch)

@@ -326,3 +326,46 @@ def test_dynamic_sd_only_captures_scheduled_query_lengths(monkeypatch):
                 assert desc.num_tokens == num_tokens
                 assert desc.num_reqs is None
             assert desc.num_active_loras == 0
+
+
+def test_parallel_drafter_keeps_full_query_width_with_dynamic_sd(monkeypatch):
+    """Dynamic target K must not shrink the parallel drafter CUDA graph."""
+
+    max_num_seqs = 32
+    max_spec_tokens = 8
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    vllm_config = _create_vllm_config_for_dsd(
+        max_num_seqs=max_num_seqs,
+        max_spec_tokens=max_spec_tokens,
+        cudagraph_mode="FULL_DECODE_ONLY",
+        num_spec_per_batch_size=[(1, max_num_seqs, 2)],
+    )
+    manager = gpu_cudagraph_utils.CudaGraphManager(
+        vllm_config=vllm_config,
+        device=torch.device("cpu"),
+        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+        decode_query_len=max_spec_tokens,
+        use_dynamic_decode_query_lens=False,
+    )
+    manager._graphs_captured = True
+
+    full_desc = manager.dispatch(
+        num_reqs=8,
+        num_tokens=8 * max_spec_tokens,
+        uniform_token_count=max_spec_tokens,
+        num_active_loras=0,
+    )
+    assert full_desc.cg_mode == CUDAGraphMode.FULL
+    assert full_desc.uniform_token_count == max_spec_tokens
+
+    short_desc = manager.dispatch(
+        num_reqs=8,
+        num_tokens=8 * 2,
+        uniform_token_count=2,
+        num_active_loras=0,
+    )
+    assert short_desc.cg_mode == CUDAGraphMode.NONE

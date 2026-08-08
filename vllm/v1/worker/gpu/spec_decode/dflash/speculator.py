@@ -131,6 +131,10 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.device,
             cudagraph_mode,
             decode_query_len=self.num_query_per_req,
+            # Dynamic SD changes target verification width, not the parallel
+            # drafter's checkpoint-defined query block. Capture the full draft
+            # width even when the target verifies only a prefix.
+            use_dynamic_decode_query_lens=False,
         )
 
     def capture(self) -> None:

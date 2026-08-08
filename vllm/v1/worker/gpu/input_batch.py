@@ -109,6 +109,11 @@ class InputBatch:
     # stays valid for every replay the graph serves.
     max_query_len: int | None = None
 
+    # [num_reqs] number of logits produced before adaptive verification trims
+    # per-request draft prefixes. Structured-output masks are created by the
+    # scheduler for this original layout and use it to recover request offsets.
+    original_num_logits_per_req: np.ndarray | None = None
+
     @classmethod
     def make_dummy(
         cls,
@@ -200,6 +205,7 @@ class InputBatch:
             has_structured_output_reqs=False,
             prompt_lens=None,
             max_query_len=max_query_len,
+            original_num_logits_per_req=np.ones(num_reqs, dtype=np.int32),
         )
 
 

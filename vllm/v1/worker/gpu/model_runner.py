@@ -1140,6 +1140,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # No draft token scheduled (common case).
             total_num_draft_tokens = 0
             total_num_logits = num_reqs
+            original_num_logits_per_req = np.ones(num_reqs, dtype=np.int32)
             cu_num_logits_np = np.arange(num_reqs + 1, dtype=np.int32)
             cu_num_logits = torch.arange(
                 num_reqs + 1, device=self.device, dtype=torch.int32
@@ -1168,6 +1169,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             else:
                 num_draft_tokens_per_req = scheduled_draft_tokens_per_req
             num_bonus_tokens = self.model_state.num_new_sampled_tokens_per_step
+            original_num_logits_per_req = (
+                scheduled_draft_tokens_per_req + num_bonus_tokens
+            )
             total_num_draft_tokens = int(num_draft_tokens_per_req.sum())
             total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
             if adaptive_verification is None:
@@ -1317,6 +1321,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_query_len=(
                 original_max_query_len if adaptive_verification is not None else None
             ),
+            original_num_logits_per_req=original_num_logits_per_req,
         )
         return pcp.maybe_partition_pcp_batch(self.pcp_manager, input_batch)
 

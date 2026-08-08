@@ -9,6 +9,60 @@ from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
 
+def _prepare_grammar_bitmask(
+    input_batch: InputBatch,
+    grammar_req_ids: list[str],
+    grammar_bitmask: np.ndarray,
+    mask_stride: int,
+) -> tuple[list[int], np.ndarray]:
+    """Match scheduler grammar rows to the final per-request logit layout.
+
+    The scheduler produces a contiguous group of masks for every structured
+    request using the full speculative window. Adaptive verification can later
+    keep a shorter prefix for each request. Select that prefix (including the
+    row that becomes its bonus-token mask) while retaining the original group
+    sizes to find the next request's rows.
+    """
+    mapping: list[int] = []
+    selected_rows: list[int] = []
+    req_id_to_idx = {req_id: i for i, req_id in enumerate(input_batch.req_ids)}
+    cu_num_logits = input_batch.cu_num_logits_np
+    original_num_logits = input_batch.original_num_logits_per_req
+    if original_num_logits is None:
+        raise RuntimeError(
+            "Structured-output mask compaction requires the original per-request "
+            "logit layout."
+        )
+    source_offset = 0
+
+    for grammar_req_id in grammar_req_ids:
+        req_idx = req_id_to_idx[grammar_req_id]
+        actual_count = int(cu_num_logits[req_idx + 1] - cu_num_logits[req_idx])
+        original_count = int(original_num_logits[req_idx])
+        if not 0 <= actual_count <= original_count:
+            raise RuntimeError(
+                "Structured-output logit layout exceeds its scheduler mask layout: "
+                f"request={grammar_req_id!r}, actual={actual_count}, "
+                f"original={original_count}."
+            )
+
+        selected_rows.extend(range(source_offset, source_offset + actual_count))
+        mapping.extend(
+            req_idx * mask_stride + position for position in range(actual_count)
+        )
+        source_offset += original_count
+
+    if source_offset != grammar_bitmask.shape[0]:
+        raise RuntimeError(
+            "Structured-output mask rows do not match the scheduler logit layout: "
+            f"masks={grammar_bitmask.shape[0]}, expected={source_offset}."
+        )
+
+    if len(selected_rows) != source_offset:
+        grammar_bitmask = grammar_bitmask[np.asarray(selected_rows, dtype=np.intp)]
+    return mapping, grammar_bitmask
+
+
 class StructuredOutputsWorker:
     def __init__(
         self,
@@ -37,27 +91,16 @@ class StructuredOutputsWorker:
         if not grammar_req_ids:
             return
 
+        mapping, grammar_bitmask = _prepare_grammar_bitmask(
+            input_batch, grammar_req_ids, grammar_bitmask, self.mask_stride
+        )
+        if not mapping:
+            return
+
         # Asynchronously copy the bitmask to GPU.
         with torch.cuda.stream(self.copy_stream):
             bitmask = async_copy_to_gpu(
                 grammar_bitmask, out=self.grammar_bitmask[: grammar_bitmask.shape[0]]
-            )
-
-        # Construct bitmask -> logits mapping
-        mapping: list[int] = []
-        req_ids = input_batch.req_ids
-        cu_num_logits = input_batch.cu_num_logits_np.tolist()
-        req_id_to_idx = {req_id: i for i, req_id in enumerate(req_ids)}
-        for grammar_req_id in grammar_req_ids:
-            req_idx = req_id_to_idx[grammar_req_id]
-            logits_start_idx = cu_num_logits[req_idx]
-            logits_end_idx = cu_num_logits[req_idx + 1]
-            # Key by (request, position) rather than absolute logit index:
-            # adaptive verification finalizes per-request logit offsets on
-            # device, so the kernel resolves them from the GPU cu_num_logits.
-            mapping.extend(
-                req_idx * self.mask_stride + position
-                for position in range(logits_end_idx - logits_start_idx)
             )
 
         # Asynchronously copy the mapping to GPU.

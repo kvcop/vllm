@@ -308,6 +308,15 @@ class SpeculativeConfig:
     they deliberately do not contribute to :meth:`compute_hash`.
     """
 
+    dspark_confidence_capture_path: str | None = None
+    """Private root directory for payload-free DSpark calibration shards."""
+
+    dspark_confidence_capture_max_rows: int | None = Field(default=None, gt=0)
+    """Hard row cap for DSpark confidence capture."""
+
+    dspark_confidence_capture_shard_rows: int = Field(default=4096, gt=0)
+    """Maximum rows in each DSpark confidence capture shard."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -1439,6 +1448,47 @@ class SpeculativeConfig:
                 raise ValueError(
                     "dspark_confidence_temperatures entries must be finite and "
                     f"positive, got {self.dspark_confidence_temperatures}."
+                )
+
+        capture_path = self.dspark_confidence_capture_path
+        capture_max_rows = self.dspark_confidence_capture_max_rows
+        if capture_path is not None and not capture_path.strip():
+            raise ValueError("dspark_confidence_capture_path must not be empty")
+        capture_enabled = capture_path is not None
+        if capture_enabled != (capture_max_rows is not None):
+            raise ValueError(
+                "dspark_confidence_capture_path and "
+                "dspark_confidence_capture_max_rows must be set together"
+            )
+        if capture_enabled:
+            if self.method != "dspark":
+                raise ValueError("Confidence capture is only supported by DSpark")
+            if self.num_speculative_tokens > 255:
+                raise ValueError(
+                    "DSpark confidence capture requires num_speculative_tokens <= 255"
+                )
+            if self.enable_adaptive_verification:
+                raise ValueError(
+                    "DSpark confidence capture requires "
+                    "enable_adaptive_verification=false"
+                )
+            if self.draft_sample_method != "probabilistic":
+                raise ValueError(
+                    "DSpark confidence capture requires "
+                    "draft_sample_method='probabilistic'"
+                )
+            if self.rejection_sample_method != "standard":
+                raise ValueError(
+                    "DSpark confidence capture requires probabilistic rejection "
+                    "sampling (rejection_sample_method='standard')"
+                )
+            if self.dspark_confidence_temperatures is not None and any(
+                temperature != 1.0
+                for temperature in self.dspark_confidence_temperatures
+            ):
+                raise ValueError(
+                    "DSpark confidence capture requires identity confidence "
+                    "temperatures or no STS temperatures"
                 )
 
         if self.draft_model_config:

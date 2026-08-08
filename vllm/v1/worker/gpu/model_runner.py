@@ -34,6 +34,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
+    get_tp_group,
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
@@ -127,6 +128,10 @@ from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 from vllm.v1.worker.gpu.spec_decode import init_speculator
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     AdaptiveVerificationManager,
+)
+from vllm.v1.worker.gpu.spec_decode.dspark.calibration_collector import (
+    DSparkCalibrationCollector,
+    is_capture_writer,
 )
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
@@ -270,6 +275,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_prefill_lookahead=num_prefill_lookahead,
         )
         self.adaptive_verification: AdaptiveVerificationManager | None = None
+        self.confidence_collector: DSparkCalibrationCollector | None = None
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
             max_num_tokens=self.max_num_tokens,
@@ -376,6 +382,53 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.num_speculative_steps
             + self.model_state.num_new_sampled_tokens_per_step
         )
+
+        capture_path = (
+            self.speculative_config.dspark_confidence_capture_path
+            if self.speculative_config is not None
+            else None
+        )
+        if capture_path is not None:
+            assert self.speculative_config is not None
+            tp_group = get_tp_group()
+            elected = is_capture_writer(
+                is_last_pp_rank=self.is_last_pp_rank,
+                tp_rank=tp_group.rank_in_group,
+                tp_world_size=tp_group.world_size,
+            )
+            assert not elected or (self.is_last_pp_rank and tp_group.rank_in_group == 0)
+            qwen_dspark = (
+                self.speculative_config.draft_model_config is not None
+                and "Qwen3DSparkModel"
+                in self.speculative_config.draft_model_config.architectures
+            )
+            if qwen_dspark:
+                assert self.model_state.num_new_sampled_tokens_per_step == 1, (
+                    "Qwen DSpark confidence capture requires exactly one bonus token"
+                )
+            if elected:
+                max_rows = self.speculative_config.dspark_confidence_capture_max_rows
+                assert max_rows is not None
+                self.confidence_collector = DSparkCalibrationCollector(
+                    capture_path,
+                    max_rows=max_rows,
+                    num_speculative_tokens=self.num_speculative_steps,
+                    max_num_slots=self.max_num_reqs,
+                    dp_rank=self.dp_rank,
+                    shard_rows=(
+                        self.speculative_config.dspark_confidence_capture_shard_rows
+                    ),
+                )
+            logger.info_once(
+                "DSpark confidence capture enabled path=%s dp_rank=%d "
+                "tp_writer=%s max_rows=%d shard_rows=%d; capture runs are "
+                "excluded from performance measurements",
+                capture_path,
+                self.dp_rank,
+                elected,
+                self.speculative_config.dspark_confidence_capture_max_rows,
+                self.speculative_config.dspark_confidence_capture_shard_rows,
+            )
 
         # Initialize samplers. Model states may override via custom_sampler().
         if self.is_last_pp_rank and not self.is_pooling_model:
@@ -942,6 +995,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_index = self.req_states.req_id_to_index[req_id]
             if self.adaptive_verification is not None:
                 self.adaptive_verification.add_request(req_index)
+            if self.confidence_collector is not None:
+                self.confidence_collector.add_request(req_index)
 
             if self.pooling_runner is not None:
                 assert new_req_data.pooling_params is not None
@@ -1659,6 +1714,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
+        capture_proposal_mask = None
+        if self.confidence_collector is not None:
+            capture_proposal_mask = self.confidence_collector.observe(
+                idx_mapping=input_batch.idx_mapping_np,
+                cu_num_logits=input_batch.cu_num_logits_np,
+                is_prefilling=input_batch.is_prefilling_np,
+                num_sampled=num_sampled,
+                num_rejected=num_rejected,
+                num_bonus_tokens=self.model_state.num_new_sampled_tokens_per_step,
+            )
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
@@ -1748,6 +1813,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.sampler.sampling_states.seeds.gpu,
                 mm_inputs=mm_inputs,
             )
+            if self.confidence_collector is not None:
+                assert capture_proposal_mask is not None
+                self.confidence_collector.record_proposal(
+                    raw_logits=self.speculator.draft_token_confidence_logits[
+                        : input_batch.num_reqs
+                    ],
+                    idx_mapping=input_batch.idx_mapping_np,
+                    proposal_mask=capture_proposal_mask,
+                )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
             if self.adaptive_verification is not None:
                 self.adaptive_verification.record_confidences(
@@ -1824,6 +1898,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def shutdown(self) -> None:
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
+        if self.confidence_collector is not None:
+            self.confidence_collector.close()
         torch.accelerator.synchronize()
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()

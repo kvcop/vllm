@@ -14,6 +14,7 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
 from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
     DSparkSpeculator,
     _calibrate_confidence_logits,
+    _confidence_computation_enabled,
 )
 
 
@@ -44,7 +45,10 @@ def test_record_confidence_restores_request_major_step_layout():
     speculator.model = PositionCodedConfidenceModel()
     speculator._confidence_temperatures = torch.tensor([[1.0, 2.0, 4.0]])
     speculator.draft_token_confidence_probs = torch.empty((2, 3))
-    head_hidden = torch.tensor([[0.0], [2.0], [4.0], [10.0], [20.0], [40.0]])
+    speculator.draft_token_confidence_logits = torch.empty((2, 3), dtype=torch.float32)
+    head_hidden = torch.tensor(
+        [[0.0], [2.0], [4.0], [10.0], [20.0], [40.0]], dtype=torch.float16
+    )
     markov_by_step = [
         torch.tensor([[float(step)], [float(10 + step)]]) for step in range(3)
     ]
@@ -53,6 +57,17 @@ def test_record_confidence_restores_request_major_step_layout():
 
     expected = torch.sigmoid(torch.tensor([[0.0, 1.0, 1.0], [10.0, 10.0, 10.0]]))
     torch.testing.assert_close(speculator.draft_token_confidence_probs, expected)
+    torch.testing.assert_close(
+        speculator.draft_token_confidence_logits,
+        head_hidden.float().view(2, 3),
+    )
+    assert speculator.draft_token_confidence_logits.dtype == torch.float32
+
+
+def test_capture_only_enables_confidence_computation():
+    assert _confidence_computation_enabled(False, "/private/capture")
+    assert _confidence_computation_enabled(True, None)
+    assert not _confidence_computation_enabled(False, None)
 
 
 def test_equal_survival_budget_is_stable_and_prefers_shallow_steps():

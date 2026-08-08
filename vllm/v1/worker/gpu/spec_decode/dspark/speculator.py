@@ -50,6 +50,12 @@ def _calibrate_confidence_logits(
     return torch.sigmoid(logits.float() / temperatures)
 
 
+def _confidence_computation_enabled(
+    enable_adaptive_verification: bool, capture_path: str | None
+) -> bool:
+    return enable_adaptive_verification or capture_path is not None
+
+
 class DSparkSpeculator(DFlashSpeculator):
     _speculator_name = "DSpark"
 
@@ -95,8 +101,18 @@ class DSparkSpeculator(DFlashSpeculator):
         self.draft_token_confidence_probs = torch.empty_like(
             self.draft_tokens, dtype=torch.float32
         )
+        self.draft_token_confidence_logits = torch.empty_like(
+            self.draft_tokens, dtype=torch.float32
+        )
         self.enable_adaptive_verification = (
             self.speculative_config.enable_adaptive_verification
+        )
+        self.enable_confidence_capture = (
+            self.speculative_config.dspark_confidence_capture_path is not None
+        )
+        self.compute_confidence = _confidence_computation_enabled(
+            self.enable_adaptive_verification,
+            self.speculative_config.dspark_confidence_capture_path,
         )
         confidence_temperatures = self.speculative_config.dspark_confidence_temperatures
         if confidence_temperatures is None:
@@ -108,9 +124,11 @@ class DSparkSpeculator(DFlashSpeculator):
             else "sts_calibrated"
         )
         logger.info_once(
-            "DSpark confidence calibration mode=%s temperatures=%s",
+            "DSpark confidence mode=%s temperatures=%s adaptive=%s capture=%s",
             calibration_mode,
             confidence_temperatures_tuple,
+            self.enable_adaptive_verification,
+            self.enable_confidence_capture,
         )
         # Keep this fixed-shape buffer alive for CUDA graph replay. The request
         # dimension broadcasts only after flat confidence logits are restored
@@ -130,8 +148,10 @@ class DSparkSpeculator(DFlashSpeculator):
             sample_hidden,
             torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
         ).view(num_reqs, n_spec)
+        raw_logits = self.draft_token_confidence_logits[:num_reqs]
+        raw_logits.copy_(confidence_logits.float())
         self.draft_token_confidence_probs[:num_reqs] = _calibrate_confidence_logits(
-            confidence_logits, self._confidence_temperatures
+            raw_logits, self._confidence_temperatures
         )
 
     def load_draft_model(
@@ -156,12 +176,11 @@ class DSparkSpeculator(DFlashSpeculator):
                 dtype=self.draft_logits.dtype,
                 device=self.device,
             )
-        if self.enable_adaptive_verification and model.model.confidence_head is None:
+        if self.compute_confidence and model.model.confidence_head is None:
             raise ValueError(
-                "Adaptive verification needs a DSpark checkpoint with a confidence "
-                "head, and this one has none. Pass "
-                "enable_adaptive_verification=false in the speculative config to verify"
-                " a fixed number of drafts instead."
+                "Adaptive verification and confidence capture need a DSpark "
+                "checkpoint with a confidence head, and this one has none. Disable "
+                "both modes to verify a fixed number of drafts instead."
             )
         return model
 
@@ -223,7 +242,7 @@ class DSparkSpeculator(DFlashSpeculator):
         for i in range(n_spec):
             # Sequential stage: Markov bias from the previously sampled token.
             markov_embed = self.model.markov_embed(prev)
-            if self.enable_adaptive_verification:
+            if self.compute_confidence:
                 confidence_markov_embeds.append(markov_embed)
             bias = self.model.markov_bias(markov_embed)
             logits_i = base_logits[:, i] + bias
@@ -233,7 +252,7 @@ class DSparkSpeculator(DFlashSpeculator):
             self.draft_tokens[:num_reqs, i] = draft_sampled_i
             prev = draft_sampled_i
 
-        if self.enable_adaptive_verification:
+        if self.compute_confidence:
             self._record_confidence_probs(
                 num_reqs, sample_hidden, confidence_markov_embeds
             )
@@ -264,7 +283,7 @@ class DSparkSpeculator(DFlashSpeculator):
 
         for i in range(n_spec):
             markov_embed = self.model.markov_embed(prev)
-            if self.enable_adaptive_verification:
+            if self.compute_confidence:
                 confidence_markov_embeds.append(markov_embed)
             logits_i = self.model.apply_markov_bias_gathered(
                 markov_embed,
@@ -278,7 +297,7 @@ class DSparkSpeculator(DFlashSpeculator):
             self.draft_tokens[:num_reqs, i] = draft_sampled_i
             prev = draft_sampled_i
 
-        if self.enable_adaptive_verification:
+        if self.compute_confidence:
             self._record_confidence_probs(
                 num_reqs, sample_hidden, confidence_markov_embeds
             )

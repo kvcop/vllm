@@ -46,6 +46,36 @@ Use calibrated values only after fitting them from held-out left-to-right sequen
 
 The production scheduler uses confidence scores from exactly two decode steps earlier (`t−2`) to select the next global verification budget. This preserves a fixed captured graph for the current target forward; it is distinct from the paper's synchronous all-candidate allocation algorithm.
 
+### Collecting calibration data
+
+DSpark can collect bounded, payload-free calibration shards while adaptive verification is disabled. Collection is intentionally strict: it requires full-block verification, probabilistic drafting and rejection sampling, and either omitted or all-ones confidence temperatures. For example:
+
+```json
+{
+  "method": "dspark",
+  "model": "RedHatAI/Qwen3.6-35B-A3B-speculator.dspark",
+  "num_speculative_tokens": 8,
+  "draft_sample_method": "probabilistic",
+  "enable_adaptive_verification": false,
+  "dspark_confidence_capture_path": "/private/dspark-calibration",
+  "dspark_confidence_capture_max_rows": 100000,
+  "dspark_confidence_capture_shard_rows": 4096,
+  "dspark_confidence_temperatures": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+}
+```
+
+Each data-parallel rank writes to its own private `dp-NNNN` directory. Only TP rank zero on the last pipeline stage is elected as its writer. Shards have mode `0600`, stop at the configured hard row cap, and contain only:
+
+- `raw_logits`: `float32[N,K]`, captured before temperature scaling and sigmoid;
+- `prefix_mask`: `uint8[N,K]` prefix-survival labels;
+- `verified_lengths`, `accepted_counts`: `uint8[N]`;
+- `request_ordinal`: opaque `uint64[N]` values;
+- `proposal_seq`: `uint32[N]` and `engine_step`: `uint64[N]`.
+
+For each row, only positions below `verified_lengths` are observed; later positions are censored and must not be treated as negative labels. The capture never stores request IDs, token IDs, prompts, responses, hidden states, or target/draft vocabulary logits.
+
+Capture performs confidence-head compute, device-to-host copies, and synchronous shard writes. Exclude capture runs from throughput, TTFT, latency, and other performance conclusions.
+
 ## Requirements and limitations
 
 - The attention backend must tolerate device-decided query lengths, since the CPU lengths only bound them from above. Backends that plan off the CPU lengths are excluded by the attention selector, and rejected at startup for models that hard-wire their backend.

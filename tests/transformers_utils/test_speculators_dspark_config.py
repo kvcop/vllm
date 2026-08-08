@@ -67,6 +67,7 @@ def _make_qwen_dspark_config(
     sample_from_anchor: bool = True,
     num_speculative_tokens: int = 8,
     dspark_confidence_temperatures: list[float] | None = None,
+    **speculative_kwargs,
 ):
     target_path = tmp_path / "target"
     draft_path = tmp_path / "draft"
@@ -82,6 +83,7 @@ def _make_qwen_dspark_config(
         target_model_config=target_config,
         target_parallel_config=ParallelConfig(),
         dspark_confidence_temperatures=dspark_confidence_temperatures,
+        **speculative_kwargs,
     )
 
 
@@ -156,6 +158,121 @@ def test_confidence_temperatures_are_dspark_only():
             method="ngram",
             num_speculative_tokens=2,
             dspark_confidence_temperatures=[1.0, 1.0],
+        )
+
+
+@pytest.mark.cpu_test
+def test_dspark_confidence_capture_accepts_bounded_probabilistic_identity_mode(
+    tmp_path,
+):
+    capture_path = tmp_path / "capture"
+    config = _make_qwen_dspark_config(
+        tmp_path / "models",
+        draft_sample_method="probabilistic",
+        dspark_confidence_capture_path=str(capture_path),
+        dspark_confidence_capture_max_rows=100,
+        dspark_confidence_capture_shard_rows=11,
+        dspark_confidence_temperatures=[1.0] * 8,
+    )
+
+    assert config.dspark_confidence_capture_path == str(capture_path)
+    assert config.dspark_confidence_capture_max_rows == 100
+    assert config.dspark_confidence_capture_shard_rows == 11
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        (
+            {"dspark_confidence_capture_path": "capture"},
+            "must be set together",
+        ),
+        (
+            {"dspark_confidence_capture_max_rows": 10},
+            "must be set together",
+        ),
+        (
+            {
+                "dspark_confidence_capture_path": " ",
+                "dspark_confidence_capture_max_rows": 10,
+            },
+            "must not be empty",
+        ),
+        (
+            {
+                "dspark_confidence_capture_path": "capture",
+                "dspark_confidence_capture_max_rows": 10,
+                "enable_adaptive_verification": True,
+            },
+            "enable_adaptive_verification=false",
+        ),
+        (
+            {
+                "dspark_confidence_capture_path": "capture",
+                "dspark_confidence_capture_max_rows": 10,
+            },
+            "draft_sample_method='probabilistic'",
+        ),
+        (
+            {
+                "dspark_confidence_capture_path": "capture",
+                "dspark_confidence_capture_max_rows": 10,
+                "draft_sample_method": "probabilistic",
+                "rejection_sample_method": "block",
+            },
+            "probabilistic rejection sampling",
+        ),
+        (
+            {
+                "dspark_confidence_capture_path": "capture",
+                "dspark_confidence_capture_max_rows": 10,
+                "draft_sample_method": "probabilistic",
+                "dspark_confidence_temperatures": [1.0] * 7 + [2.0],
+            },
+            "identity confidence temperatures",
+        ),
+    ],
+)
+def test_dspark_confidence_capture_rejects_unsafe_modes(tmp_path, kwargs, match):
+    kwargs = dict(kwargs)
+    temperatures = kwargs.pop("dspark_confidence_temperatures", None)
+    with pytest.raises(ValueError, match=match):
+        _make_qwen_dspark_config(
+            tmp_path,
+            dspark_confidence_temperatures=temperatures,
+            **kwargs,
+        )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("dspark_confidence_capture_max_rows", 0),
+        ("dspark_confidence_capture_shard_rows", 0),
+    ],
+)
+def test_dspark_confidence_capture_rejects_nonpositive_bounds(tmp_path, field, value):
+    kwargs = {
+        "draft_sample_method": "probabilistic",
+        "dspark_confidence_capture_path": "capture",
+        "dspark_confidence_capture_max_rows": 10,
+        field: value,
+    }
+    with pytest.raises(ValueError, match="greater than 0"):
+        _make_qwen_dspark_config(tmp_path, **kwargs)
+
+
+@pytest.mark.cpu_test
+def test_confidence_capture_is_dspark_only():
+    with pytest.raises(ValueError, match="only supported by DSpark"):
+        SpeculativeConfig(
+            method="ngram",
+            num_speculative_tokens=2,
+            draft_sample_method="probabilistic",
+            dspark_confidence_capture_path="capture",
+            dspark_confidence_capture_max_rows=10,
         )
 
 

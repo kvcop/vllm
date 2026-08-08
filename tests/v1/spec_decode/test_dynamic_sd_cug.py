@@ -15,7 +15,9 @@ from vllm.config import (
     SchedulerConfig,
     VllmConfig,
 )
+from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.worker.gpu import cudagraph_utils as gpu_cudagraph_utils
+from vllm.v1.worker.gpu.spec_decode.dflash import speculator as dflash_speculator
 
 pytestmark = pytest.mark.cpu_test
 
@@ -363,9 +365,43 @@ def test_parallel_drafter_keeps_full_query_width_with_dynamic_sd(monkeypatch):
     assert full_desc.uniform_token_count == max_spec_tokens
 
     short_desc = manager.dispatch(
-        num_reqs=8,
-        num_tokens=8 * 2,
+        num_reqs=2,
+        num_tokens=2 * max_spec_tokens,
         uniform_token_count=2,
         num_active_loras=0,
     )
     assert short_desc.cg_mode == CUDAGraphMode.NONE
+
+
+def test_parallel_drafter_wires_fixed_query_width(monkeypatch):
+    """The DFlash/DSpark call site must opt out of dynamic target widths."""
+
+    captured: dict[str, object] = {}
+
+    class RecordingManager:
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        dflash_speculator,
+        "DFlashCudaGraphManager",
+        RecordingManager,
+    )
+    speculator = SimpleNamespace(
+        attn_cg_support=SimpleNamespace(
+            min_cg_support=AttentionCGSupport.UNIFORM_BATCH,
+            min_cg_attn_backend="TRITON_ATTN",
+        ),
+        _speculator_name="DSpark",
+        vllm_config=MagicMock(spec=VllmConfig),
+        device=torch.device("cpu"),
+        num_query_per_req=8,
+        query_cudagraph_manager=None,
+    )
+
+    dflash_speculator.DFlashSpeculator.init_cudagraph_manager(
+        speculator, CUDAGraphMode.FULL
+    )
+
+    assert captured["decode_query_len"] == 8
+    assert captured["use_dynamic_decode_query_lens"] is False

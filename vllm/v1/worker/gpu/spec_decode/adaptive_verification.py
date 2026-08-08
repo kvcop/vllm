@@ -182,6 +182,7 @@ class AdaptiveVerificationManager:
         # Bound adaptive verification to one rejection-sampler chunk.
         self._max_total_logits = max_total_logits
         self.cost_tables: tuple[np.ndarray, np.ndarray] | None = None
+        self._trim_logged = False
         # Largest cudagraph-captured token count; above it nothing pads.
         self._cudagraph_limit = 0
         self._batch_budget: tuple[dict[str, int], dict[str, int], int] | None = None
@@ -400,14 +401,17 @@ class AdaptiveVerificationManager:
             for req_id, num_tokens in zip(req_ids, num_non_draft_tokens, strict=True)
         }
         draft_budget = int(np.argmax(num_tokens_to_estimated_accepted_tokens / costs))
-        if draft_budget < int(scheduled_drafts.sum()):
-            logger.info_once(
+        if not getattr(self, "_trim_logged", False) and draft_budget < int(
+            scheduled_drafts.sum()
+        ):
+            logger.info(
                 "DSpark adaptive verification reduced scheduled drafts: "
                 "profile_context_len=%d, scheduled=%d, selected=%d",
                 envs.VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN,
                 int(scheduled_drafts.sum()),
                 draft_budget,
             )
+            self._trim_logged = True
         num_drafts_per_req = {
             req_id: int(num_drafts)
             for req_id, num_drafts in zip(req_ids, scheduled_drafts, strict=True)

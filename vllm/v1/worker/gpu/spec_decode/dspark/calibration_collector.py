@@ -83,6 +83,7 @@ class DSparkCalibrationCollector:
         max_num_slots: int,
         dp_rank: int,
         shard_rows: int = DEFAULT_CAPTURE_SHARD_ROWS,
+        start_armed: bool = True,
     ) -> None:
         if max_rows <= 0:
             raise ValueError(f"max_rows must be positive, got {max_rows}.")
@@ -126,12 +127,14 @@ class DSparkCalibrationCollector:
             self._next_proposal_seq,
             self._engine_step,
         ) = self._load_existing_capture_state()
+        self._request_ordinal_start = self._next_request_ordinal
         if self._total_rows > self.max_rows:
             raise ValueError(
                 f"Existing capture has {self._total_rows} rows, above the configured "
                 f"hard cap {self.max_rows}."
             )
         self._rows: list[tuple[np.ndarray, np.ndarray, int, int, int, int, int]] = []
+        self._armed = start_armed
         self._closed = False
 
     @property
@@ -142,6 +145,21 @@ class DSparkCalibrationCollector:
     def pending_valid(self) -> np.ndarray:
         """Return a copy for diagnostics and focused tests."""
         return self._pending_valid.copy()
+
+    @property
+    def armed(self) -> bool:
+        return self._armed
+
+    def arm(self) -> None:
+        """Start capture after startup warm-up and discard its slot state."""
+        if self._closed:
+            raise RuntimeError("Cannot arm a closed collector.")
+        if self._armed:
+            return
+        self._current_request_ordinal.fill(0)
+        self._pending_valid.fill(False)
+        self._next_request_ordinal = self._request_ordinal_start
+        self._armed = True
 
     def _load_existing_capture_state(self) -> tuple[int, int, int, int, int]:
         prefix = f"capture-dp{self.dp_rank:04d}-shard"
@@ -260,14 +278,17 @@ class DSparkCalibrationCollector:
         if np.any(np.diff(cu_logits) < 0):
             raise ValueError("cu_num_logits must be non-decreasing.")
 
+        proposal_mask = (sampled > 0) & ~prefilling
+        if not self._armed:
+            self._pending_valid.fill(False)
+            return proposal_mask
+
         if self._engine_step >= np.iinfo(np.uint64).max:
             raise OverflowError("DSpark capture engine step exhausted uint64.")
         self._engine_step += 1
         present = np.zeros(self.max_num_slots, dtype=np.bool_)
         present[slots] = True
         self._pending_valid[~present] = False
-
-        proposal_mask = (sampled > 0) & ~prefilling
         for row, slot_value in enumerate(slots):
             slot = int(slot_value)
             if not self._pending_valid[slot]:
@@ -324,6 +345,8 @@ class DSparkCalibrationCollector:
         """Record raw confidence logits for the proposal just produced."""
         if self._closed:
             raise RuntimeError("Cannot record a proposal with a closed collector.")
+        if not self._armed:
+            return
         if self._total_rows >= self.max_rows:
             return
 

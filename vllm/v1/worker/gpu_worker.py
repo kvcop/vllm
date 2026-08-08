@@ -852,6 +852,14 @@ class Worker(WorkerBase):
         # intra-op parallelism.
         set_torch_threads_for_runtime()
 
+        # Exclude every startup execution from confidence calibration. V2 runs
+        # scheduler-realistic sample steps after CUDA graph capture, while eager
+        # mode skips capture_model entirely, so this must be the single arming
+        # point after all warm-up paths.
+        confidence_collector = getattr(self.model_runner, "confidence_collector", None)
+        if confidence_collector is not None:
+            confidence_collector.arm()
+
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,

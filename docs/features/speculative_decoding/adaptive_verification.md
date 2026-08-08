@@ -76,6 +76,8 @@ For each row, only positions below `verified_lengths` are observed; later positi
 
 Capture performs confidence-head compute, device-to-host copies, and synchronous shard writes. Exclude capture runs from throughput, TTFT, latency, and other performance conclusions.
 
+Startup warm-up requests are excluded from capture. Do not combine calibration capture with elastic expert parallelism: an elastic scale-up can repeat scheduler-realistic warm-up after capture has started.
+
 ## Requirements and limitations
 
 - The attention backend must tolerate device-decided query lengths, since the CPU lengths only bound them from above. Backends that plan off the CPU lengths are excluded by the attention selector, and rejected at startup for models that hard-wire their backend.

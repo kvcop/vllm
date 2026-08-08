@@ -418,6 +418,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     shard_rows=(
                         self.speculative_config.dspark_confidence_capture_shard_rows
                     ),
+                    start_armed=False,
                 )
             logger.info_once(
                 "DSpark confidence capture enabled path=%s dp_rank=%d "

@@ -130,6 +130,46 @@ def test_slot_reuse_invalidates_pending_proposal(tmp_path):
     assert not list((tmp_path / "dp-0002").glob("*.npz"))
 
 
+def test_unarmed_collector_excludes_startup_warmup(tmp_path):
+    collector = DSparkCalibrationCollector(
+        tmp_path,
+        max_rows=20,
+        num_speculative_tokens=3,
+        max_num_slots=1,
+        dp_rank=2,
+        shard_rows=20,
+        start_armed=False,
+    )
+    warmup_ordinal = collector.add_request(0)
+    proposal_mask = _observe(collector, slots=[0], verified=[0], accepted=[0])
+    collector.record_proposal(
+        raw_logits=np.ones((1, 3), dtype=np.float32),
+        idx_mapping=np.array([0]),
+        proposal_mask=proposal_mask,
+    )
+    _observe(collector, slots=[0], verified=[3], accepted=[3])
+
+    assert collector.total_rows == 0
+    assert not collector.pending_valid.any()
+
+    collector.arm()
+    assert collector.armed
+    assert collector.add_request(0) == warmup_ordinal
+    proposal_mask = _observe(collector, slots=[0], verified=[0], accepted=[0])
+    collector.record_proposal(
+        raw_logits=np.ones((1, 3), dtype=np.float32),
+        idx_mapping=np.array([0]),
+        proposal_mask=proposal_mask,
+    )
+    _observe(collector, slots=[0], verified=[3], accepted=[2])
+    collector.close()
+
+    assert collector.total_rows == 1
+    [shard] = sorted((tmp_path / "dp-0002").glob("*.npz"))
+    with np.load(shard) as data:
+        assert data["request_ordinal"].tolist() == [warmup_ordinal]
+
+
 def test_pending_slot_absent_from_next_batch_is_invalidated(tmp_path):
     collector = _collector(tmp_path)
     collector.add_request(0)

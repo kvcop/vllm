@@ -44,6 +44,7 @@ as its own commit with its existing focused tests and provenance.
 | SM89 NVFP4 W4A8 kernel and mixed-layer selection | `../vllm_benchmark/specs/007-qwen38-model-evaluation/ops/e348-w4a8-sm89-candidate/` | Supervised Qwen3.8 candidate. Only eligible NVFP4 MLP layers use W4A8; FP8 GDN projections and the NVFP4 `lm_head` retain their Marlin routes. |
 | ModelOpt mixed FP8-block handling required by the measured checkpoint | `../vllm_benchmark/specs/007-qwen38-model-evaluation/ops/e348-nvfp4-mtp-fp8-candidate/` | Import only with the adjacent W4A8/FP8 routing tests. |
 | Per-request complete prefix-cache exclusion | `../vllm_benchmark/specs/007-qwen38-model-evaluation/ops/e356-echo-no-cache/` | Planned service-isolation feature for short-lived Echo requests; not enabled globally. |
+| Qwen3.5 native MTP on pipeline-parallel targets | Local fork commit and focused `test_qwen3_5_mtp_pp.py` coverage. | The V2 runner owns the complete draft on the last target PP rank. The draft keeps its embedding, fusion projection, MTP block, final norm and LM head together instead of waiting for draft-side intermediates that the earlier target ranks never produce. Native MTP consumes the target's final hidden state and does not request Eagle3 auxiliary states. |
 
 The Qwen3.8 chat template is intentionally tracked by the deployment repository
 as an explicit asset. It should be moved into this fork only if the runtime

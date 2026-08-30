@@ -3,6 +3,7 @@
 """Inference-only Qwen3_5 MTP model."""
 
 from collections.abc import Iterable
+from typing import ClassVar, Literal
 
 import torch
 from torch import nn
@@ -10,7 +11,6 @@ from torch import nn
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, get_current_vllm_config
-from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -40,7 +40,6 @@ from .interfaces import (
 )
 from .utils import (
     AutoWeightsLoader,
-    PPMissingLayer,
     _merge_multimodal_embeddings,
     make_empty_intermediate_tensors_factory,
     maybe_fuse_shared_experts,
@@ -145,19 +144,15 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
-        if get_pp_group().is_first_rank:
-            if inputs_embeds is None:
-                inputs_embeds = self.embed_input_ids(input_ids)
-            assert hidden_states.shape[-1] == inputs_embeds.shape[-1]
-            inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
-            hidden_states = self.pre_fc_norm_hidden(hidden_states)
-            hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
-            hidden_states = self.fc(hidden_states)
-            residual = None
-        else:
-            assert intermediate_tensors is not None
-            hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
+        del intermediate_tensors
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_input_ids(input_ids)
+        assert hidden_states.shape[-1] == inputs_embeds.shape[-1]
+        inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
+        hidden_states = self.pre_fc_norm_hidden(hidden_states)
+        hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
+        hidden_states = self.fc(hidden_states)
+        residual = None
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
         mtp_layer = self.layers[current_step_idx]
@@ -166,11 +161,6 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             hidden_states=hidden_states,
             residual=residual,
         )
-
-        if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
 
         if mtp_layer.use_attn_reduce_scatter_for_moe:
             hidden_states, residual = _all_gather_hidden_and_residual(
@@ -210,6 +200,14 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
     }
 )
 class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
+    """Native MTP draft owned by the last target pipeline rank.
+
+    The V2 runner creates the speculator only on that rank. Native MTP consumes
+    the target's final hidden state and does not use Eagle3 auxiliary states.
+    """
+
+    supports_pp: ClassVar[Literal[True]] = True
+
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -237,20 +235,25 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "mtp")
         )
 
-        if get_pp_group().is_last_rank:
-            if config.tie_word_embeddings:
-                self.lm_head = self.model.embed_tokens
-            else:
-                self.lm_head = ParallelLMHead(
-                    config.vocab_size,
-                    config.hidden_size,
-                    quant_config=self.quant_config,
-                    prefix=maybe_prefix(prefix, "lm_head"),
-                )
+        if config.tie_word_embeddings:
+            self.lm_head = self.model.embed_tokens
         else:
-            self.lm_head = PPMissingLayer()
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=self.quant_config,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
+
+    def make_empty_intermediate_tensors(
+        self,
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> IntermediateTensors:
+        return self.model.make_empty_intermediate_tensors(batch_size, dtype, device)
 
     def embed_input_ids(
         self,

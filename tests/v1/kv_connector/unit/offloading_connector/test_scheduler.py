@@ -6,7 +6,12 @@ from unittest.mock import MagicMock, call
 import pytest
 import torch
 
+from tests.v1.kv_connector.unit.offloading_connector.test_config import (
+    _make_mamba_hybrid_kv_cache_config,
+    _make_vllm_config,
+)
 from tests.v1.kv_connector.unit.offloading_connector.utils import (
+    MockOffloadingSpec,
     generate_store_output,
     to_keys,
 )
@@ -15,6 +20,9 @@ from vllm.distributed.kv_events import MEDIUM_CPU, BlockRemoved, BlockStored
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
     OffloadingWorkerMetadata,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
+    build_offloading_config,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
@@ -25,7 +33,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     RequestOffloadState,
     is_store_reachable_swa_chunk,
 )
-from vllm.v1.core.kv_cache_utils import BlockHash
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
+    KVCacheBlock,
+    make_block_hash_with_group_id,
+)
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,
@@ -57,6 +70,46 @@ def _reduce_kv_connector_stats(runner):
         for key, value in stats.reduce().items():
             reduced[key] = reduced.get(key, 0) + value
     return reduced
+
+
+def test_recurrent_unhashed_block_does_not_truncate_load_boundary():
+    """A recurrent group's unhashed state may precede the load boundary."""
+    vllm_config = _make_vllm_config()
+    kv_cache_config = _make_mamba_hybrid_kv_cache_config()
+    spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
+    scheduler = OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
+
+    request = MagicMock()
+    request.request_id = "req"
+    request.kv_transfer_params = None
+    request.num_prompt_tokens = 64
+    request.num_tokens = 64
+    request.block_hashes = [BlockHash(f"b{i}".encode()) for i in range(16)]
+    request.all_token_ids = list(range(64))
+    request.lora_request = None
+    request.is_finished.return_value = False
+    scheduler.on_new_request(request)
+
+    req_status = scheduler._req_status["req"]
+    req_status.num_locally_computed_tokens = 16
+    req_status.update_offload_keys()
+
+    full_blocks = [KVCacheBlock(31), KVCacheBlock(32)]
+    recurrent_blocks = [KVCacheBlock(41), KVCacheBlock(42)]
+    full_blocks[0].set_block_hash(
+        make_block_hash_with_group_id(BlockHash(b"h0"), 0), 16
+    )
+
+    scheduler.update_state_after_alloc(
+        request,
+        KVCacheBlocks((full_blocks, recurrent_blocks)),
+        num_external_tokens=16,
+    )
+
+    [load_job] = scheduler._current_batch_load_jobs.values()
+    loaded = list(load_job.dst_spec.block_ids)
+    assert 41 not in loaded
+    assert 42 in loaded
 
 
 def test_scheduler_reports_allocation_failure(request_runner):

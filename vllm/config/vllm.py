@@ -599,6 +599,12 @@ class VllmConfig:
         if self._dflash_needs_multi_kv_group():
             return True
 
+        # The DFlash2 candidate selector exists only in the V2 speculator. On V1
+        # the same checkpoint drafts through DFlashProposer, which never calls
+        # it, so the draft degrades to DFlash1 silently.
+        if self._is_dflash2_draft():
+            return True
+
         # Drafters that read auxiliary hidden states need those states relayed
         # from the stages that compute them to the last stage, where the drafter
         # lives. Only the V2 runner configures the aux taps on non-last stages,
@@ -634,6 +640,16 @@ class VllmConfig:
             return False
 
         return True
+
+    def _is_dflash2_draft(self) -> bool:
+        """Whether the configured DFlash draft uses the DFlash2 architecture."""
+        spec = self.speculative_config
+        if spec is None or spec.method != "dflash":
+            return False
+        draft_config = getattr(spec, "draft_model_config", None)
+        if draft_config is None:
+            return False
+        return "DFlash2DraftModel" in (draft_config.architectures or [])
 
     def _dflash_needs_multi_kv_group(self) -> bool:
         """Whether a DFlash draft mixes sliding-window and full attention."""

@@ -1725,7 +1725,12 @@ def test_load_config_rejects_non_string_load_format(bad_load_format):
         LoadConfig(load_format=bad_load_format)
 
 
-def _v2_selection_stub(method: str | None, pipeline_parallel_size: int):
+def _v2_selection_stub(
+    method: str | None,
+    pipeline_parallel_size: int,
+    *,
+    is_dflash2: bool = False,
+):
     """Minimal stand-in for `VllmConfig.use_v2_model_runner`'s inputs.
 
     A real `VllmConfig` here would need a downloadable draft checkpoint; the
@@ -1744,6 +1749,7 @@ def _v2_selection_stub(method: str | None, pipeline_parallel_size: int):
         speculative_config=speculative_config,
         model_config=None,
         _dflash_needs_multi_kv_group=lambda: False,
+        _is_dflash2_draft=lambda: is_dflash2,
         _is_default_v2_model_runner_model=lambda: False,
     )
 
@@ -1765,6 +1771,12 @@ def test_aux_hidden_state_drafters_do_not_force_v2_without_pp(monkeypatch):
     monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
     stub = _v2_selection_stub("dflash", pipeline_parallel_size=1)
     assert VllmConfig.use_v2_model_runner.fget(stub) is False
+
+
+def test_dflash2_forces_v2(monkeypatch):
+    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+    stub = _v2_selection_stub("dflash", pipeline_parallel_size=1, is_dflash2=True)
+    assert VllmConfig.use_v2_model_runner.fget(stub) is True
 
 
 def test_final_hidden_state_drafters_are_left_alone_under_pp(monkeypatch):

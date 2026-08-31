@@ -23,12 +23,14 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     rejection_sample,
 )
 
-# Cap on the FP32 target-logits buffer materialized by apply_sampling_params.
+# Cap the FP32 target-logits buffer materialized by apply_sampling_params at
+# half of a 64 MiB runtime reserve. Request boundaries may make a chunk smaller;
+# a single request wider than the cap remains intact.
 # TODO(mgoin): Chunking is a workaround. The rejection kernels already upcast
 # per vocab block on load and apply ops like temperature and gumbel, so folding
 # sampling-param application into those kernels would remove this buffer and
 # its traffic entirely.
-MAX_CHUNK_BYTES = 2**30  # 1GB
+MAX_CHUNK_BYTES = 32 * 2**20
 _FP32_BYTES = 4
 
 
@@ -125,6 +127,21 @@ class RejectionSampler:
             logits_mode=self.sampler.logprobs_mode
             in ("raw_logits", "processed_logits"),
         )
+
+    def profile_run(self, logits: torch.Tensor, input_batch: InputBatch) -> None:
+        """Warm up rejection sampling while holding its largest FP32 chunk."""
+        max_chunk_logits = max(1, MAX_CHUNK_BYTES // (logits.shape[1] * _FP32_BYTES))
+        largest_chunk_logits = max(
+            int(input_batch.cu_num_logits_np[end] - input_batch.cu_num_logits_np[start])
+            for start, end in _iter_request_chunks(
+                input_batch.cu_num_logits_np, max_chunk_logits
+            )
+        )
+        fp32_scratch = torch.empty_like(
+            logits[:largest_chunk_logits], dtype=torch.float32
+        ).copy_(logits[:largest_chunk_logits])
+        self(logits, input_batch)
+        del fp32_scratch
 
     def _verify(
         self,

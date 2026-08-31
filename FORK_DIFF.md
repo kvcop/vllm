@@ -69,9 +69,16 @@ The preserved source set is:
 
 Source bundles live under
 `../vllm_benchmark/specs/007-qwen38-model-evaluation/ops/` as
-`e341-*`, `e343-*` and `e345-dflash-sampler-memory-v0271.patch`. A future branch
-should be named by base and purpose, for example `qwen38-v0271-dflash`, and must
-record the exact subset imported.
+`e341-*`, `e343-*` and `e345-dflash-sampler-memory-v0271.patch`.
+
+The `qwen38-v0271-dflash-pp2-e358` branch imports the frozen DFlash2 model,
+selector, lookup, sampling and runner integration from the E336/E343 runtime
+line, plus the E345 rejection-sampler allocation fix. Its runner merge also
+retains the native-MTP PP draft relay, the auxiliary-hidden-state relay from
+`13b123c7c7` and the PP memory warmup from `1ed495cbe`. It deliberately does not
+import the optional E343 split-KV attention backend or speed-knob registry: the
+selected `k7`/FP8-KV profile cannot use the bf16-only attention path and does
+not require those compile-cache controls.
 
 ## Experiments that are not default fork behavior
 

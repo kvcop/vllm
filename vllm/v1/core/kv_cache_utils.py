@@ -1852,6 +1852,31 @@ def get_kv_cache_groups(
     return groups
 
 
+def compute_per_worker_kv_bytes_per_block(
+    kv_cache_configs: list[KVCacheConfig],
+) -> list[int] | None:
+    """Per-worker KV bytes per block, in worker-rank order.
+
+    Each worker's footprint is its projected tensors divided by the shared
+    block count. Returns None when there is fewer than two workers or every
+    worker reports the same footprint (TP-only), so homogeneous engines keep
+    their previous configuration shape.
+    """
+    if len(kv_cache_configs) < 2:
+        return None
+    per_worker = [
+        (
+            sum(tensor.size for tensor in cfg.kv_cache_tensors) // cfg.num_blocks
+            if cfg.num_blocks > 0 and cfg.kv_cache_tensors
+            else 0
+        )
+        for cfg in kv_cache_configs
+    ]
+    if len(set(per_worker)) == 1:
+        return None
+    return per_worker
+
+
 def generate_scheduler_kv_cache_config(
     kv_cache_configs: list[KVCacheConfig],
 ) -> KVCacheConfig:
@@ -2238,6 +2263,15 @@ def get_kv_cache_configs(
                 f"{max_model_len:,}",
                 max_concurrency,
             )
+
+    # Register each worker's post-projection per-block KV footprint (after
+    # num_blocks equalization, which preserves the per-block ratio) so
+    # shared-storage consumers (native CPU KV offload) can size stage-aware
+    # layouts under pipeline parallelism instead of assuming a uniform view.
+    per_worker_kv_bytes = compute_per_worker_kv_bytes_per_block(kv_cache_configs)
+    if per_worker_kv_bytes is not None:
+        for kv_cache_config in kv_cache_configs:
+            kv_cache_config.per_worker_kv_bytes_per_block = per_worker_kv_bytes
 
     return kv_cache_configs
 

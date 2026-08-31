@@ -19,13 +19,66 @@ from vllm.v1.kv_offload.config import (
 )
 
 if TYPE_CHECKING:
-    from vllm.config import VllmConfig
+    from vllm.config import ParallelConfig, VllmConfig
     from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheTensor
 
 
 def is_kv_cache_tensor_packed(kv_cache_tensor: "KVCacheTensor") -> bool:
     """Return whether a KV cache tensor uses a packed block stride."""
     return bool(kv_cache_tensor.block_stride)
+
+
+def _resolve_registered_worker_kv_bytes(
+    kv_cache_config: "KVCacheConfig",
+    parallel_config: "ParallelConfig",
+) -> tuple[int, ...] | None:
+    """Registered per-worker KV bytes per block, validated for shared storage.
+
+    Under pipeline parallelism each stage projects a different layer set, so
+    per-block KV footprints differ across stages and a worker's local view
+    cannot size a layout shared with the other stages. The engine core
+    registers every worker's footprint on KVCacheConfig; consumers that share
+    storage across workers must derive their layout from that table. Fail
+    closed when pipeline parallelism has no registered layout or the table
+    disagrees with the declared parallel sizes.
+    """
+    registered = kv_cache_config.per_worker_kv_bytes_per_block
+    if registered is None:
+        needs_layout = (
+            parallel_config.world_size > 1
+            and parallel_config.pipeline_parallel_size > 1
+        )
+        if needs_layout:
+            raise ValueError(
+                "Pipeline-parallel KV offloading requires the registered "
+                "per-worker KV layout (KVCacheConfig.per_worker_kv_bytes_per_"
+                "block), but this KVCacheConfig carries none. Refusing to "
+                "share storage across unequal stage views."
+            )
+        return None
+    world_size = parallel_config.world_size
+    if len(registered) != world_size:
+        raise ValueError(
+            f"registered per-worker KV layout has {len(registered)} entries "
+            f"but world_size is {world_size}"
+        )
+    tp_size = parallel_config.tensor_parallel_size
+    pp_size = parallel_config.pipeline_parallel_size
+    if tp_size * pp_size != world_size:
+        raise ValueError(
+            f"TP ({tp_size}) x PP ({pp_size}) does not cover world_size "
+            f"{world_size}; cannot validate the per-worker KV layout"
+        )
+    # TP ranks of one PP stage must hold identical footprints; only stages
+    # may differ.
+    for stage in range(pp_size):
+        stage_entries = registered[stage * tp_size : (stage + 1) * tp_size]
+        if len(set(stage_entries)) != 1:
+            raise ValueError(
+                f"per-worker KV layout disagrees inside PP stage {stage}: "
+                f"{stage_entries}"
+            )
+    return tuple(registered)
 
 
 def build_offloading_config(
@@ -135,6 +188,8 @@ def build_offloading_config(
         and parallel_config.nnodes_within_dp == 1
     )
 
+    by_rank = _resolve_registered_worker_kv_bytes(kv_cache_config, parallel_config)
+
     # Only a single non-MLA full-attention group is parallelism-invariant:
     # MLA latent KV is replicated per rank (never head-sharded), and the V2
     # model runner's KV layout is not known to be parallelism-invariant.
@@ -177,6 +232,7 @@ def build_offloading_config(
             dcp_size=parallel_config.decode_context_parallel_size,
             data_parallel_index=parallel_config.data_parallel_index,
             is_parallelism_agnostic=is_parallelism_agnostic,
+            worker_kv_bytes_per_block_by_rank=by_rank,
         ),
         replicated_layout=replicated_layout,
     )

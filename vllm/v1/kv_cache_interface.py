@@ -988,6 +988,14 @@ class KVCacheConfig:
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
 
+    # KV bytes per block stored by each worker, in worker-rank order. Set for
+    # multi-worker engines by `get_kv_cache_configs`; None on single-worker or
+    # hand-built configs. Under pipeline parallelism stages own different
+    # layer sets, so entries are stage-dependent and shared-storage consumers
+    # (e.g. native CPU KV offload) must size their layout from this table
+    # instead of assuming one uniform worker view.
+    per_worker_kv_bytes_per_block: list[int] | None = None
+
     @property
     def has_mamba_layers(self) -> bool:
         return any(isinstance(g.kv_cache_spec, MambaSpec) for g in self.kv_cache_groups)

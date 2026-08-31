@@ -51,6 +51,12 @@ class OffloadingParallelConfig:
     # True when concatenating a block's data across all workers yields
     # the same result regardless of the parallelism configuration.
     is_parallelism_agnostic: bool
+    # KV bytes per block stored by each worker, in rank order. None when the
+    # layout was not registered (single-worker config paths). Under pipeline
+    # parallelism stages own different layer sets, so entries are
+    # stage-dependent and shared-storage backends must size their layout from
+    # this table instead of the local view.
+    worker_kv_bytes_per_block_by_rank: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)

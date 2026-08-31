@@ -51,6 +51,7 @@ def _make_offloading_config(
     data_parallel_index: int = 0,
     is_parallelism_agnostic: bool = False,
     replicated_layout: bool = False,
+    worker_kv_bytes_per_block_by_rank: tuple[int, ...] | None = None,
     extra_config: dict[str, Any] | None = None,
 ) -> OffloadingConfig:
     normalized_extra_config = dict(extra_config or {})
@@ -82,6 +83,7 @@ def _make_offloading_config(
             dcp_size=dcp_size,
             data_parallel_index=data_parallel_index,
             is_parallelism_agnostic=is_parallelism_agnostic,
+            worker_kv_bytes_per_block_by_rank=worker_kv_bytes_per_block_by_rank,
         ),
         replicated_layout=replicated_layout,
     )
@@ -139,6 +141,8 @@ def test_cpu_spec_sizes_normalized_worker_layout():
     # The CPU spec now rounds the offloaded row up to the mmap page size
     # (matching the shared region), so kv_bytes_per_chunk picks up padding
     # while cpu_page_size_per_worker stays the un-padded per-worker slot.
+    # A uniform registered table (all stages report the same footprint) must
+    # reproduce the legacy TP-only arithmetic exactly.
     alignment = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
     spec = _create_spec(
         cpu_bytes_to_use=alignment * 3,
@@ -147,12 +151,76 @@ def test_cpu_spec_sizes_normalized_worker_layout():
         world_size=6,
         tp_size=3,
         pp_size=2,
+        worker_kv_bytes_per_block_by_rank=(16,) * 6,
     )
 
     assert isinstance(spec, CPUOffloadingSpec)
     assert spec.cpu_page_size_per_worker == 32
     assert spec.kv_bytes_per_chunk == alignment
     assert spec.num_blocks == 3
+
+
+def test_cpu_spec_refuses_pp_without_registered_layout():
+    # Pipeline-parallel stage views are unequal by construction; without the
+    # registered per-worker layout the spec must refuse to size one shared
+    # mmap from a single local view instead of guessing.
+    with pytest.raises(Exception, match="registered per-worker KV layout"):
+        _create_spec(
+            worker_kv_bytes_per_block=16,
+            world_size=6,
+            tp_size=3,
+            pp_size=2,
+        )
+
+
+def test_cpu_spec_refuses_registered_layout_rank_mismatch():
+    # The local view must match this rank's registered slot; a drift between
+    # projection and registration is a refusal, not a best-effort attach.
+    with pytest.raises(Exception, match="registered per-worker layout slot"):
+        _create_spec(
+            worker_kv_bytes_per_block=16,
+            world_size=4,
+            tp_size=2,
+            pp_size=2,
+            rank=3,
+            worker_kv_bytes_per_block_by_rank=(16, 16, 16, 24),
+        )
+
+
+def test_cpu_spec_sizes_pp_stage_heterogeneous_layout():
+    # Stage 1 carries one extra full-attention layer, so its per-block
+    # footprint is larger. The shared row is the sum of all per-rank slot
+    # widths (padded once to the page size), not world_size * local bytes,
+    # and every rank resolves the identical num_blocks from that row.
+    alignment = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
+    stage0, stage1 = 2 * alignment, 2 * alignment + alignment // 2
+    row_stride = 2 * stage0 + 2 * stage1  # 9 * alignment, already aligned
+    spec_rank0 = _create_spec(
+        cpu_bytes_to_use=row_stride * 3,
+        worker_kv_bytes_per_block=stage0,
+        world_size=4,
+        tp_size=2,
+        pp_size=2,
+        rank=0,
+        worker_kv_bytes_per_block_by_rank=(stage0, stage0, stage1, stage1),
+    )
+    assert isinstance(spec_rank0, CPUOffloadingSpec)
+    assert spec_rank0.cpu_page_size_per_worker == stage0
+    assert spec_rank0.kv_bytes_per_chunk == row_stride
+    assert spec_rank0.num_blocks == 3
+
+    spec_rank3 = _create_spec(
+        cpu_bytes_to_use=row_stride * 3,
+        worker_kv_bytes_per_block=stage1,
+        world_size=4,
+        tp_size=2,
+        pp_size=2,
+        rank=3,
+        worker_kv_bytes_per_block_by_rank=(stage0, stage0, stage1, stage1),
+    )
+    assert spec_rank3.cpu_page_size_per_worker == stage1
+    assert spec_rank3.kv_bytes_per_chunk == spec_rank0.kv_bytes_per_chunk
+    assert spec_rank3.num_blocks == spec_rank0.num_blocks
 
 
 def test_cpu_spec_zero_worker_bytes_produces_empty_cache():
@@ -174,6 +242,7 @@ def test_tiering_spec_aligns_row_size():
         world_size=6,
         tp_size=3,
         pp_size=2,
+        worker_kv_bytes_per_block_by_rank=(16,) * 6,
     )
 
     assert isinstance(spec, TieringOffloadingSpec)

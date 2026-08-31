@@ -3,6 +3,7 @@
 import mmap
 import os
 import time
+from collections.abc import Callable
 
 import torch
 
@@ -33,7 +34,10 @@ class SharedOffloadRegion:
     the rest open the existing file and wait until it reaches the expected
     size.  Each worker then mmap()s the full file.
 
-    File path: /dev/shm/vllm_offload_{engine_id}.mmap
+    File path: /dev/shm/vllm_offload_{engine_id}.mmap. When a barrier is
+    provided, the path is unlinked after every worker has mapped the file. The
+    kernel can then reclaim the inode after the last mapping closes even when
+    workers exit without running cleanup.
     """
 
     BLOCK_SIZE_ALIGNMENT: int = mmap.PAGESIZE
@@ -45,6 +49,7 @@ class SharedOffloadRegion:
         rank: int | None,
         kv_bytes_per_block: int,
         cpu_page_size: int,
+        barrier: Callable[[], None] | None = None,
     ) -> None:
         self.page_size = mmap.PAGESIZE
         assert kv_bytes_per_block % self.page_size == 0
@@ -84,6 +89,19 @@ class SharedOffloadRegion:
             flags=mmap.MAP_SHARED,
             prot=mmap.PROT_READ | mmap.PROT_WRITE,
         )
+
+        if barrier is not None:
+            try:
+                barrier()
+            except Exception:
+                self.mmap_obj.close()
+                os.close(self.fd)
+                if self._creator:
+                    os.unlink(self.mmap_path)
+                raise
+            if self._creator:
+                os.unlink(self.mmap_path)
+                logger.info("Unlinked mmap file %s", self.mmap_path)
 
         # MADV_POPULATE_WRITE was added in Linux 5.14 (value 23).
         _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
@@ -205,6 +223,8 @@ class SharedOffloadRegion:
             try:
                 os.unlink(self.mmap_path)
                 logger.info("Removed mmap file %s", self.mmap_path)
+            except FileNotFoundError:
+                pass
             except Exception:
                 logger.warning(
                     "Failed to unlink path %s", self.mmap_path, exc_info=True

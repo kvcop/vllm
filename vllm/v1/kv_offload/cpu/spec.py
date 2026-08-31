@@ -102,13 +102,26 @@ class CPUOffloadingSpec(OffloadingSpec):
         self.kv_bytes_per_chunk = 0
         self.cpu_page_size_per_worker = 0
         self.replicated_layout = config.replicated_layout and self._uses_shared_region()
+        # Chunk width of every worker's slot in the shared mmap region, in
+        # rank order. Under pipeline parallelism each PP stage owns a
+        # different layer set, so per-block KV footprints are stage-dependent
+        # and the local view alone cannot size the shared row: every process
+        # resolves the identical registered table instead, and the local view
+        # is verified against it (fail closed) rather than trusted.
+        self._slot_chunk_widths = self._resolve_slot_chunk_widths(world_size)
         if config.worker_kv_bytes_per_block > 0 and world_size > 0:
-            num_copies = 1 if self.replicated_layout else world_size
-            kv_bytes_per_block = config.worker_kv_bytes_per_block * num_copies
-            kv_bytes_per_chunk = kv_bytes_per_block * self.blocks_per_chunk
+            if self.replicated_layout:
+                num_copies = 1
+                slot_widths = [config.worker_kv_bytes_per_block * self.blocks_per_chunk]
+            else:
+                num_copies = world_size
+                slot_widths = self._slot_chunk_widths
+            kv_bytes_per_chunk = sum(slot_widths)
 
             # calculate cpu_page_size_per_worker
-            self.cpu_page_size_per_worker = kv_bytes_per_chunk // num_copies
+            self.cpu_page_size_per_worker = slot_widths[
+                min(config.parallel.rank, num_copies - 1)
+            ]
 
             # calculate num_blocks
             aligned_kv_bytes_per_chunk = round_up(
@@ -133,6 +146,43 @@ class CPUOffloadingSpec(OffloadingSpec):
         self.cache_policy_module_path: str | None = self.extra_config.get(
             "cache_policy_module_path"
         )
+
+    def _resolve_slot_chunk_widths(self, world_size: int) -> list[int]:
+        """Return the per-rank chunk-width table of the shared offload region.
+
+        Without a registered per-worker layout this is the local width
+        replicated world-wide, which is only safe when every rank holds the
+        same layers (TP-only). With pipeline parallelism a registered layout
+        is mandatory: stage views differ, so the table sizes the shared row
+        with per-stage accounting and each process verifies its local view
+        against its own slot before attaching.
+        """
+        config = self.config
+        by_rank = config.parallel.worker_kv_bytes_per_block_by_rank
+        local_chunk_width = config.worker_kv_bytes_per_block * self.blocks_per_chunk
+        if by_rank is None:
+            if config.parallel.pp_size > 1:
+                raise Exception(
+                    "CPU offloading with pipeline_parallel_size > 1 requires "
+                    "the registered per-worker KV layout "
+                    "(KVCacheConfig.per_worker_kv_bytes_per_block); this "
+                    "configuration path did not provide one. Refusing to size "
+                    "one shared mmap from unequal stage views."
+                )
+            return [local_chunk_width] * world_size
+        if len(by_rank) != world_size:
+            raise Exception(
+                f"registered per-worker KV layout has {len(by_rank)} entries "
+                f"but world_size is {world_size}"
+            )
+        if by_rank[config.parallel.rank] * self.blocks_per_chunk != local_chunk_width:
+            raise Exception(
+                f"local KV view is {config.worker_kv_bytes_per_block} bytes per "
+                f"block but the registered per-worker layout slot "
+                f"{config.parallel.rank} is {by_rank[config.parallel.rank]}; "
+                "refusing to attach to a mismatched offload layout"
+            )
+        return [width * self.blocks_per_chunk for width in by_rank]
 
     @override
     def get_manager(self) -> OffloadingManager:
@@ -160,24 +210,49 @@ class CPUOffloadingSpec(OffloadingSpec):
         per-rank tensor); replicated-layout dedup is gated on this being True."""
         return current_platform.is_cuda_alike()
 
+    def _region_rank(self) -> int:
+        """Slot this worker occupies in the shared region's row layout."""
+        if self.replicated_layout:
+            # Replicated layout puts all ranks on slot 0 (single MLA copy).
+            return 0
+        world_size = self.config.parallel.world_size
+        return torch.accelerator.current_device_index() % world_size
+
     def create_worker(self, kv_caches: CanonicalKVCaches) -> CPUOffloadingWorker:
         mmap_region: SharedOffloadRegion | None = None
         # num_blocks == 0 would size the region to zero bytes, which cannot be
         # mmap'd; fall back to the tensor path (empty tensors) as before.
         if self._uses_shared_region() and self.num_blocks > 0:
-            # Replicated layout puts all ranks on slot 0 (single MLA copy);
-            # otherwise each rank takes its own slot by physical device index.
-            if self.replicated_layout:
-                rank = 0
-            else:
-                world_size = self.config.parallel.world_size
-                rank = torch.accelerator.current_device_index() % world_size
+            rank = self._region_rank()
+            if not self.replicated_layout:
+                # Fail closed: the slot this worker would occupy must match
+                # the device-derived rank and its own local KV footprint.
+                if rank >= len(self._slot_chunk_widths):
+                    raise Exception(
+                        f"worker slot {rank} is outside the registered offload "
+                        f"layout ({len(self._slot_chunk_widths)} slots)"
+                    )
+                local_chunk_width = (
+                    self.config.worker_kv_bytes_per_block * self.blocks_per_chunk
+                )
+                if self._slot_chunk_widths[rank] != local_chunk_width:
+                    raise Exception(
+                        f"worker slot {rank} expects "
+                        f"{self._slot_chunk_widths[rank]} chunk bytes but the "
+                        f"local KV view is {local_chunk_width}; refusing to "
+                        "attach to a mismatched offload layout"
+                    )
+            # Uniform tables keep the legacy two-value region form, so the
+            # TP-only layout stays byte-compatible; only genuinely unequal
+            # stage views switch to the explicit per-rank slot table.
+            uniform_slots = len(set(self._slot_chunk_widths)) <= 1
             mmap_region = SharedOffloadRegion(
                 engine_id=self.config.engine_id,
                 num_blocks=self.num_blocks,
                 rank=rank,
                 kv_bytes_per_block=self.kv_bytes_per_chunk,
                 cpu_page_size=self.cpu_page_size_per_worker,
+                slot_page_sizes=None if uniform_slots else self._slot_chunk_widths,
                 barrier=_all_workers_barrier,
             )
         return CPUOffloadingWorker(

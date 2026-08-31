@@ -72,6 +72,11 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
+from vllm.v1.worker.pp_stage_timing import (
+    NULL_PP_STAGE_TIMER,
+    PPStageTimerLike,
+    maybe_make_pp_stage_timer,
+)
 from vllm.v1.worker.sentinel.gpu_worker_sentinel import WorkerSentinel
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
@@ -101,21 +106,27 @@ class AsyncIntermediateTensors(IntermediateTensors):
         tensors: dict[str, torch.Tensor],
         comm_handles: list[Handle] | None = None,
         comm_postprocess: list[Callable[[], None]] | None = None,
+        timer: "PPStageTimerLike | None" = None,
     ) -> None:
         super().__init__(tensors)
         self._comm_handles = comm_handles
         self._comm_postprocess = comm_postprocess
         self._comm_waited = False
+        self._timer = timer if timer is not None else NULL_PP_STAGE_TIMER
 
     def wait_for_comm(self) -> None:
         if self._comm_waited:
             return
-        if self._comm_handles:
-            for handle in self._comm_handles:
-                handle.wait()
-        if self._comm_postprocess:
-            for fn in self._comm_postprocess:
-                fn()
+        # `handle.wait()` only inserts a stream dependency for NCCL, so the
+        # stall it causes is on the device timeline; `device_region` records
+        # CUDA events, which is the only clock that can see it.
+        with self._timer.device_region("recv_wait"):
+            if self._comm_handles:
+                for handle in self._comm_handles:
+                    handle.wait()
+            if self._comm_postprocess:
+                for fn in self._comm_postprocess:
+                    fn()
         self._comm_waited = True
 
     def __getattribute__(self, name: str):
@@ -174,6 +185,9 @@ class Worker(WorkerBase):
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
+        # Replaced in `init_device` when VLLM_PP_STAGE_TIMING is set; the null
+        # timer's regions are a shared nullcontext, so timing is free when off.
+        self._pp_stage_timer: PPStageTimerLike = NULL_PP_STAGE_TIMER
 
         # Resolved lazily on first sleep/wake; persists worker-process state.
         self._sleep_mode_backend: SleepModeBackend | None = None
@@ -379,6 +393,11 @@ class Worker(WorkerBase):
                 self.distributed_init_method,
                 self.local_rank,
                 current_platform.dist_backend,
+            )
+
+            pp_group = get_pp_group()
+            self._pp_stage_timer = maybe_make_pp_stage_timer(
+                pp_group.rank_in_group, pp_group.world_size
             )
 
             if self.use_v2_model_runner:
@@ -1037,17 +1056,29 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        # Sampling and speculative drafting live here, not in `execute_model`,
+        # and they run only on the last PP rank. Without this region that work
+        # is invisible and the last stage looks artificially cheap.
+        with self._pp_stage_timer.device_region("sample"):
+            return self.model_runner.sample_tokens(grammar_output)
 
     @torch.inference_mode()
     @with_gpu_sync_check
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        # `step()` is a shared nullcontext unless VLLM_PP_STAGE_TIMING is set.
+        with self._pp_stage_timer.step():
+            return self._execute_model(scheduler_output)
+
+    def _execute_model(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         # ensure any previous non-blocking PP sends are complete
         if self._pp_send_work:
-            for handle in self._pp_send_work:
-                handle.wait()
+            with self._pp_stage_timer.device_region("prev_send_drain"):
+                for handle in self._pp_send_work:
+                    handle.wait()
             self._pp_send_work = []
 
         intermediate_tensors = None
@@ -1087,23 +1118,33 @@ class Worker(WorkerBase):
             }
 
         if forward_pass and not get_pp_group().is_first_rank:
-            tensor_dict, comm_handles, comm_postprocess = (
-                get_pp_group().irecv_tensor_dict(
-                    all_gather_group=get_tp_group(),
-                    all_gather_tensors=all_gather_tensors,
+            # `irecv_tensor_dict` opens with a synchronous `recv_object` on the
+            # CPU (gloo) group before posting the tensor irecvs, so this region
+            # blocks the host: wall clock is the right instrument here.
+            with self._pp_stage_timer.host_region("recv_post"):
+                tensor_dict, comm_handles, comm_postprocess = (
+                    get_pp_group().irecv_tensor_dict(
+                        all_gather_group=get_tp_group(),
+                        all_gather_tensors=all_gather_tensors,
+                    )
                 )
-            )
             assert tensor_dict is not None
             intermediate_tensors = AsyncIntermediateTensors(
                 tensor_dict,
                 comm_handles=comm_handles,
                 comm_postprocess=comm_postprocess,
+                timer=self._pp_stage_timer,
             )
 
         with self.annotate_profile(scheduler_output):
-            output = self.model_runner.execute_model(
-                scheduler_output, intermediate_tensors
-            )
+            # Device region: the model launch is async, so only CUDA events see
+            # the real forward. On a non-first stage the lazy `wait_for_comm`
+            # fires inside here, which is why `recv_wait` is reported separately
+            # and subtracted to obtain this stage's own compute.
+            with self._pp_stage_timer.device_region("exec"):
+                output = self.model_runner.execute_model(
+                    scheduler_output, intermediate_tensors
+                )
             if (
                 self.use_v2_model_runner
                 and self.model_runner.is_pooling_model
@@ -1123,11 +1164,15 @@ class Worker(WorkerBase):
         )
 
         # launch non-blocking send of intermediate tensors
-        self._pp_send_work = get_pp_group().isend_tensor_dict(
-            output.tensors,
-            all_gather_group=get_tp_group(),
-            all_gather_tensors=all_gather_tensors,
-        )
+        # `isend_tensor_dict` also opens with a synchronous `send_object` on the
+        # CPU group, so this region is host-blocking too. The device cost of the
+        # sends themselves is charged to `prev_send_drain` on the next step.
+        with self._pp_stage_timer.host_region("send_post"):
+            self._pp_send_work = get_pp_group().isend_tensor_dict(
+                output.tensors,
+                all_gather_group=get_tp_group(),
+                all_gather_tensors=all_gather_tensors,
+            )
 
         return None
 

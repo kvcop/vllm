@@ -48,6 +48,8 @@ if TYPE_CHECKING:
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_PP_LAYER_PARTITION: str | None = None
+    VLLM_PP_STAGE_TIMING: bool = False
+    VLLM_PP_STAGE_TIMING_INTERVAL: int = 100
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
@@ -852,6 +854,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
+    # Log per-stage pipeline-parallel timings (model compute vs time blocked
+    # in the inter-stage recv vs time spent in the send). Diagnostic only.
+    "VLLM_PP_STAGE_TIMING": lambda: bool(int(os.getenv("VLLM_PP_STAGE_TIMING", "0"))),
+    # How many steps each stage aggregates before logging one timing line.
+    "VLLM_PP_STAGE_TIMING_INTERVAL": lambda: int(
+        os.getenv("VLLM_PP_STAGE_TIMING_INTERVAL", "100")
+    ),
     # (CPU backend only) CPU key-value cache space.
     # default is None and will be set as 4 GB
     "VLLM_CPU_KVCACHE_SPACE": lambda: (
@@ -2172,6 +2181,11 @@ def compile_factors() -> dict[str, object]:
         "VLLM_LOGGING_CONFIG_PATH",
         "VLLM_LOGGING_COLOR",
         "VLLM_LOG_STATS_INTERVAL",
+        # Per-stage PP relay timing: diagnostic logging only, and its regions
+        # are context managers around existing calls, so it cannot change a
+        # compiled graph. Hashing it would force a recompile on every toggle.
+        "VLLM_PP_STAGE_TIMING",
+        "VLLM_PP_STAGE_TIMING_INTERVAL",
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",

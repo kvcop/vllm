@@ -374,9 +374,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.speculative_config,
                     self.device,
                 )
-            if self.speculator is not None and hasattr(
-                self.speculator, "set_sampling_states"
-            ):
+            if hasattr(self.speculator, "set_sampling_states"):
                 # DFlash2 truncates its proposal to the request's top-k/top-p.
                 self.speculator.set_sampling_states(self.sampler.sampling_states)
             self.prompt_logprobs_worker = PromptLogprobsWorker(

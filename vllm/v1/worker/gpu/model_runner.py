@@ -243,6 +243,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             device=self.device,
             num_prefill_lookahead=num_prefill_lookahead,
         )
+        if self.speculator is not None and hasattr(self.speculator, "set_req_states"):
+            # Lookup-augmented drafting reads the request token history.
+            self.speculator.set_req_states(self.req_states)
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
             max_num_tokens=self.max_num_tokens,
@@ -371,6 +374,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.speculative_config,
                     self.device,
                 )
+            if self.speculator is not None and hasattr(
+                self.speculator, "set_sampling_states"
+            ):
+                # DFlash2 truncates its proposal to the request's top-k/top-p.
+                self.speculator.set_sampling_states(self.sampler.sampling_states)
             self.prompt_logprobs_worker = PromptLogprobsWorker(
                 self.max_num_reqs,
                 logprobs_mode=self.model_config.logprobs_mode,
@@ -685,16 +693,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     @torch.inference_mode()
     def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> None:
         num_reqs = hidden_states.shape[0]
+        verify_width = self.decode_query_len
+        if verify_width > 1:
+            hidden_states = hidden_states.repeat_interleave(verify_width, dim=0)
         logits = self.model.compute_logits(hidden_states)
         dummy_input_batch = InputBatch.make_dummy(
-            num_reqs, num_reqs, self.input_buffers
+            num_reqs,
+            num_reqs * verify_width,
+            self.input_buffers,
+            num_logits_per_req=verify_width,
         )
 
         # NOTE(woosuk): During the initial memory profiling, the sampler may skip
         # top_k, top_p, and logprobs, using less GPU memory than what is possible
         # during actual execution.
         assert self.sampler is not None
-        self.sampler(logits, dummy_input_batch)
+        if self.rejection_sampler is None:
+            self.sampler(logits, dummy_input_batch)
+        else:
+            self.rejection_sampler.profile_run(logits, dummy_input_batch)
 
     @torch.inference_mode()
     def _dummy_pooler_run(self, hidden_states: torch.Tensor) -> None:
@@ -1606,9 +1623,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
+            num_draft = None
+            if self.speculator is not None and hasattr(
+                self.speculator, "next_num_draft_tokens"
+            ):
+                # Lookup-augmented drafting proposes a long block only while the request
+                # is reproducing its context; the rest of the time it asks the scheduler
+                # to verify the drafter's own (much cheaper) block.
+                num_draft = self.speculator.next_num_draft_tokens()
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
                 self.req_states.draft_tokens[input_batch.idx_mapping],
+                num_draft=num_draft,
             )
 
         # Post-step KV connector related operations.

@@ -1396,10 +1396,74 @@ class LocalArgmaxMixin:
         return top
 
 
+AUX_HIDDEN_STATE_PP_KEY_PREFIX = "aux_hidden_states."
+
+
+def aux_hidden_state_pp_key(layer_idx: int) -> str:
+    """Name of the `IntermediateTensors` slot carrying one auxiliary state.
+
+    Auxiliary hidden states are addressed by the *global* decoder layer id that
+    produced them, so a stage can forward states it did not compute itself
+    without knowing which upstream stage did.
+    """
+    return f"{AUX_HIDDEN_STATE_PP_KEY_PREFIX}{layer_idx}"
+
+
+def split_aux_hidden_state_pp_layers(
+    aux_hidden_state_layers: Iterable[int],
+    start_layer: int,
+    end_layer: int,
+    is_first_rank: bool,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Split configured auxiliary layer ids into `(upstream, outgoing)`.
+
+    `upstream` are the ids an earlier pipeline stage computed, which this stage
+    receives over the PP relay and must not recompute. `outgoing` are every id
+    available once this stage's own layers have run, i.e. `upstream` plus the
+    ids this stage produces; it is what this stage hands to the next one.
+
+    Layer id semantics follow `_maybe_add_hidden_state`: id `n` is the output
+    after decoder layer `n - 1`, and id `0` is the embedding output, which only
+    the first stage has. A stage owning layers `[start_layer, end_layer)`
+    therefore produces ids in `(start_layer, end_layer]`.
+
+    Both tuples are ascending, which is the order the drafter's `fc` expects the
+    states to be concatenated in.
+    """
+    aux = sorted(set(aux_hidden_state_layers))
+    upstream = () if is_first_rank else tuple(i for i in aux if i <= start_layer)
+    outgoing = tuple(i for i in aux if i <= end_layer)
+    return upstream, outgoing
+
+
 class EagleModelMixin:
     aux_hidden_state_layers: tuple[int, ...] = ()
 
+    supports_aux_hidden_state_pp_relay: bool = False
+    """Whether this decoder stack forwards auxiliary hidden states computed on
+    earlier pipeline stages to the last one.
+
+    The drafter is built only on the last PP rank, but the layers an EAGLE-3 /
+    DFlash / DSpark draft reads from are spread over the whole target, so
+    without a relay the states computed on stage 0 never reach it. Stacks that
+    leave this `False` cannot serve such a drafter under PP > 1 at all: the
+    failure is a silently wrong (or short) feature vector, so it is rejected up
+    front instead.
+    """
+
     def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        if layers and not self.supports_aux_hidden_state_pp_relay:
+            from vllm.distributed.parallel_state import get_pp_group
+
+            if get_pp_group().world_size > 1:
+                raise ValueError(
+                    f"{type(self).__name__} does not relay auxiliary hidden "
+                    "states across pipeline stages, so a speculative decoding "
+                    "method that consumes them (eagle3, dflash, dspark) cannot "
+                    "run with pipeline_parallel_size > 1. Use "
+                    "--pipeline-parallel-size 1 or a drafter that reads only "
+                    "the final hidden state (e.g. mtp)."
+                )
         self.aux_hidden_state_layers = layers
 
     def _maybe_add_hidden_state(

@@ -61,6 +61,8 @@ from .interfaces import (
     SupportsEagle3,
     SupportsLoRA,
     SupportsPP,
+    aux_hidden_state_pp_key,
+    split_aux_hidden_state_pp_layers,
 )
 from .utils import (
     AutoWeightsLoader,
@@ -588,6 +590,14 @@ def _all_gather_hidden_and_residual(
 
 @support_torch_compile
 class Qwen3NextModel(nn.Module, EagleModelMixin):
+    supports_aux_hidden_state_pp_relay = True
+
+    # Auxiliary layer ids received from / handed to the neighbouring stage.
+    # Both stay empty at PP=1 and are recomputed by
+    # `_set_aux_hidden_state_layers`.
+    aux_hidden_state_pp_upstream_layers: tuple[int, ...] = ()
+    aux_hidden_state_pp_outgoing_layers: tuple[int, ...] = ()
+
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_stacked={
             # weight_name: (param_name, shard_id)
@@ -629,9 +639,7 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states", "residual"], config.hidden_size
-        )
+        self._init_intermediate_tensors(config.hidden_size)
 
         if get_pp_group().is_last_rank:
             self.norm = Qwen3NextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -639,6 +647,36 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
             self.norm = PPMissingLayer()
 
         self.aux_hidden_state_layers: tuple[int, ...] = ()
+
+    def _init_intermediate_tensors(self, hidden_size: int) -> None:
+        """Build the PP relay buffer factory over a *mutable* key list.
+
+        The list is captured by reference by the factory closure, and the
+        causal-LM and multimodal wrappers alias the resulting bound method, so
+        extending it in place when the auxiliary hidden-state layers are
+        configured reaches every holder without rebuilding anything.
+        """
+        self._intermediate_tensor_keys = ["hidden_states", "residual"]
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            self._intermediate_tensor_keys, hidden_size
+        )
+
+    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        super()._set_aux_hidden_state_layers(layers)
+        pp_group = get_pp_group()
+        upstream, outgoing = split_aux_hidden_state_pp_layers(
+            self.aux_hidden_state_layers,
+            self.start_layer,
+            self.end_layer,
+            is_first_rank=pp_group.is_first_rank,
+        )
+        if pp_group.world_size == 1:
+            upstream, outgoing = (), ()
+        self.aux_hidden_state_pp_upstream_layers = upstream
+        self.aux_hidden_state_pp_outgoing_layers = outgoing
+        self._intermediate_tensor_keys[2:] = [
+            aux_hidden_state_pp_key(i) for i in upstream
+        ]
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -650,19 +688,30 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
-        if get_pp_group().is_first_rank:
+        pp_group = get_pp_group()
+        if pp_group.is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
             residual = None
+            # Auxiliary layer id 0 is the embedding output, which exists only
+            # on the first stage; on later stages `hidden_states` here is the
+            # relayed activation of an interior layer, not an embedding.
+            aux_hidden_states = self._maybe_add_hidden_state(
+                [], 0, hidden_states, residual
+            )
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+            # States computed by earlier stages, already at full token width.
+            aux_hidden_states = [
+                intermediate_tensors[aux_hidden_state_pp_key(i)]
+                for i in self.aux_hidden_state_pp_upstream_layers
+            ]
 
         full_num_tokens = positions.shape[-1]
-        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
         for layer_idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
@@ -695,10 +744,22 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
                 aux_hidden_states, layer_idx + 1, hidden_states, residual
             )
 
-        if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
+        if not pp_group.is_last_rank:
+            tensors = {"hidden_states": hidden_states, "residual": residual}
+            # `strict=True`: a drift between the ids this stage claims to hand
+            # on and the states it actually collected would otherwise reach the
+            # drafter as a silently misaligned feature vector.
+            tensors.update(
+                zip(
+                    (
+                        aux_hidden_state_pp_key(i)
+                        for i in self.aux_hidden_state_pp_outgoing_layers
+                    ),
+                    aux_hidden_states,
+                    strict=True,
+                )
             )
+            return IntermediateTensors(tensors)
         if hidden_states.shape[0] != full_num_tokens:
             hidden_states, residual = _all_gather_hidden_and_residual(
                 hidden_states,

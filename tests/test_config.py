@@ -1723,3 +1723,52 @@ def test_load_config_rejects_invalid_safetensors_load_strategy():
 def test_load_config_rejects_non_string_load_format(bad_load_format):
     with pytest.raises(pydantic.ValidationError):
         LoadConfig(load_format=bad_load_format)
+
+
+def _v2_selection_stub(method: str | None, pipeline_parallel_size: int):
+    """Minimal stand-in for `VllmConfig.use_v2_model_runner`'s inputs.
+
+    A real `VllmConfig` here would need a downloadable draft checkpoint; the
+    property only reads these four fields before the branch under test.
+    """
+    speculative_config = (
+        None
+        if method is None
+        else SimpleNamespace(method=method, draft_model_config=None)
+    )
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            pipeline_parallel_size=pipeline_parallel_size,
+        ),
+        speculative_config=speculative_config,
+        model_config=None,
+        _dflash_needs_multi_kv_group=lambda: False,
+        _is_default_v2_model_runner_model=lambda: False,
+    )
+
+
+@pytest.mark.parametrize("method", ["eagle3", "dflash", "dspark"])
+def test_aux_hidden_state_drafters_force_v2_under_pp(monkeypatch, method):
+    """Only the V2 runner taps auxiliary hidden states on non-last PP stages.
+
+    Falling back to V1 there would draft from whatever subset of the tapped
+    layers happens to sit on the last stage, so the selection must not be
+    silent.
+    """
+    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+    stub = _v2_selection_stub(method, pipeline_parallel_size=2)
+    assert VllmConfig.use_v2_model_runner.fget(stub) is True
+
+
+def test_aux_hidden_state_drafters_do_not_force_v2_without_pp(monkeypatch):
+    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+    stub = _v2_selection_stub("dflash", pipeline_parallel_size=1)
+    assert VllmConfig.use_v2_model_runner.fget(stub) is False
+
+
+def test_final_hidden_state_drafters_are_left_alone_under_pp(monkeypatch):
+    """MTP reads only the last hidden state and already runs under PP on V1."""
+    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+    stub = _v2_selection_stub("mtp", pipeline_parallel_size=2)
+    assert VllmConfig.use_v2_model_runner.fget(stub) is False

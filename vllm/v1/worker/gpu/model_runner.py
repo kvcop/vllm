@@ -207,13 +207,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.speculator = init_speculator(self.vllm_config, self.device)
 
             if self.speculative_config.method in ("eagle3", "dflash", "dspark"):
-                # Drafting may require auxiliary hidden states from target model outputs
+                # Drafting may require auxiliary hidden states from target model
+                # outputs. Under PP those states are produced on the stages that
+                # own the tapped layers and relayed to the last stage, where the
+                # drafter lives; every stage therefore taps its own layers. A
+                # target whose decoder stack does not implement that relay is
+                # rejected in EagleModelMixin._set_aux_hidden_state_layers.
                 self.use_aux_hidden_state_outputs = True
-                if self.use_pp:
-                    raise ValueError(
-                        f"{self.speculative_config.method} with pipeline parallel "
-                        "is not supported."
-                    )
 
         # Draft tokens propagation - for spec-dec + struct outputs.
         self.draft_tokens_handler = DraftTokensHandler(self.device)

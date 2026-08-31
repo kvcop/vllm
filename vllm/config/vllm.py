@@ -599,6 +599,19 @@ class VllmConfig:
         if self._dflash_needs_multi_kv_group():
             return True
 
+        # Drafters that read auxiliary hidden states need those states relayed
+        # from the stages that compute them to the last stage, where the drafter
+        # lives. Only the V2 runner configures the aux taps on non-last stages,
+        # so force V2 as for dspark: the config then either runs or raises in
+        # _validate_v2_model_runner, rather than silently drafting from whatever
+        # subset of layers happens to sit on the last stage.
+        if (
+            self.parallel_config.pipeline_parallel_size > 1
+            and self.speculative_config is not None
+            and self.speculative_config.method in ("eagle3", "dflash", "dspark")
+        ):
+            return True
+
         if self.model_config is not None and self.model_config.is_diffusion:
             return True
 

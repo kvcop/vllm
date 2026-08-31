@@ -22,6 +22,7 @@ from vllm.v1.kv_offload.cpu.common import (
 )
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
+from vllm.v1.kv_offload.cpu.policies.base import BlockStatus
 
 
 def make_req_context(
@@ -510,12 +511,16 @@ class TestARCPolicy:
     """Unit tests for CPUOffloadingManager with ARC eviction policy."""
 
     def _make_manager(
-        self, num_blocks: int = 4, enable_events: bool = True
+        self,
+        num_blocks: int = 4,
+        enable_events: bool = True,
+        store_threshold: int = 0,
     ) -> tuple[CPUOffloadingManager, ARCCachePolicy]:
         manager = make_cpu_manager(
             num_blocks=num_blocks,
             cache_policy="arc",
             enable_events=enable_events,
+            store_threshold=store_threshold,
         )
         policy = manager._policy
         assert isinstance(policy, ARCCachePolicy)
@@ -806,6 +811,258 @@ class TestARCPolicy:
         # verify events
         events = list(cpu_manager.take_events())
         assert len(events) > 0  # should have store and eviction events
+
+    def test_evict_skips_pinned_and_write_pending_blocks(self):
+        """
+        Eviction must only take blocks with ref_cnt == 0: blocks pinned by an
+        in-flight load (ref_cnt > 0) and write-pending blocks (ref_cnt == -1)
+        are skipped, and the scan falls through to the next T1 candidate.
+        """
+        cpu_manager, arc_policy = self._make_manager(num_blocks=5, enable_events=False)
+
+        cpu_manager.prepare_store(to_keys([1, 2, 3, 4]), _EMPTY_REQ_CTX)
+        cpu_manager.complete_store(to_keys([1, 2, 3, 4]), _EMPTY_REQ_CTX)
+
+        # [1, 2] pinned by an in-flight load (ref_cnt 0 -> 1)
+        cpu_manager.prepare_load(to_keys([1, 2]), _EMPTY_REQ_CTX)
+
+        # [5] allocated but its store has not completed yet (ref_cnt == -1)
+        cpu_manager.prepare_store(to_keys([5]), _EMPTY_REQ_CTX)
+        assert cpu_manager.lookup(to_key(5), _EMPTY_REQ_CTX) is LookupResult.HIT_PENDING
+
+        # storing [6] needs one eviction; the only eligible blocks are 3, 4
+        prepare_store_output = cpu_manager.prepare_store(to_keys([6]), _EMPTY_REQ_CTX)
+        verify_store_output(
+            prepare_store_output,
+            ExpectedPrepareStoreOutput(
+                keys_to_store=[6],
+                store_block_ids=[2],  # reuses block 3's slot (block ids 0-based)
+                evicted_keys=[3],
+            ),
+        )
+
+        # pinned and pending blocks survived the eviction
+        assert cpu_manager.lookup(to_key(1), _EMPTY_REQ_CTX) is LookupResult.HIT
+        assert cpu_manager.lookup(to_key(2), _EMPTY_REQ_CTX) is LookupResult.HIT
+        assert cpu_manager.lookup(to_key(5), _EMPTY_REQ_CTX) is LookupResult.HIT_PENDING
+        assert cpu_manager.lookup(to_key(3), _EMPTY_REQ_CTX) is LookupResult.MISS
+        assert to_keys([3])[0] in arc_policy.b1
+
+    def test_evict_is_atomic_when_short_of_candidates(self):
+        """
+        Policy contract: evict(n) returns None -- and changes nothing -- when
+        fewer than n eligible blocks exist, even across the T1/T2 split.
+        """
+        arc_policy = ARCCachePolicy(cache_capacity=4)
+        key_ready, key_pinned, key_pending = to_key(1), to_key(2), to_key(3)
+        block_ready = BlockStatus(0)
+        block_pinned = BlockStatus(1)
+        block_pending = BlockStatus(2)
+        block_ready.ref_cnt = 0
+        block_pinned.ref_cnt = 2  # two concurrent loads
+        block_pending.ref_cnt = -1  # store in flight
+        arc_policy.t1[key_ready] = block_ready
+        arc_policy.t1[key_pinned] = block_pinned
+        arc_policy.t2[key_pending] = block_pending
+
+        # only one eligible block exists, two requested -> refused atomically
+        assert arc_policy.evict(2, protected=set()) is None
+        assert list(arc_policy.t1) == [key_ready, key_pinned]
+        assert list(arc_policy.t2) == [key_pending]
+        assert not arc_policy.b1 and not arc_policy.b2
+
+        # the only eligible block is protected -> refused atomically
+        assert arc_policy.evict(1, protected={key_ready}) is None
+        assert list(arc_policy.t1) == [key_ready, key_pinned]
+
+        evicted = arc_policy.evict(1, protected=set())
+        assert evicted == [(key_ready, block_ready)]
+        assert list(arc_policy.t1) == [key_pinned]
+        assert key_ready in arc_policy.b1
+
+    def test_evict_refuses_batch_when_preferred_list_exhausted(self):
+        """
+        Batch eviction decrements a virtual T1 size per selected candidate:
+        once it drops below target_t1_size mid-batch, the remaining
+        candidates must come from T2. With T2 empty the whole batch is
+        refused rather than draining T1 below the adaptive target.
+
+        This refusal is load-bearing: on recency-heavy traces it preserves
+        the adapted T1 working set (see
+        benchmarks/kv_offload/simulate_arc_admission.py, where making evict
+        fall back to T1 collapses ARC's hit rate to plain LRU's).
+        """
+        arc_policy = ARCCachePolicy(cache_capacity=2)
+        key_a, key_b = to_key(1), to_key(2)
+        for key, block_id in ((key_a, 0), (key_b, 1)):
+            block = BlockStatus(block_id)
+            block.ref_cnt = 0
+            arc_policy.t1[key] = block
+        arc_policy.target_t1_size = 2.0  # |T1| == target
+
+        # First candidate comes from T1 (2 >= 2), the virtual size drops to 1,
+        # the second candidate must come from T2 -- which is empty.
+        assert arc_policy.evict(2, protected=set()) is None
+        assert list(arc_policy.t1) == [key_a, key_b]
+        assert not arc_policy.b1
+
+        # A single eviction still succeeds from T1.
+        block_a = arc_policy.t1[key_a]
+        assert arc_policy.evict(1, protected=set()) == [(key_a, block_a)]
+
+    def test_touch_keeps_write_pending_block_in_t1(self):
+        """
+        A block touched while its store is still in flight (not ready) stays
+        in T1: it has not truly been read twice yet. The next touch after
+        complete_store promotes it to T2.
+        """
+        cpu_manager, arc_policy = self._make_manager(enable_events=False)
+
+        cpu_manager.prepare_store(to_keys([1, 2]), _EMPTY_REQ_CTX)
+
+        # touch while write-pending: stays in T1, refreshed to MRU
+        cpu_manager.touch(to_keys([1]), _EMPTY_REQ_CTX)
+        assert to_keys([1])[0] in arc_policy.t1
+        assert to_keys([1])[0] not in arc_policy.t2
+
+        cpu_manager.complete_store(to_keys([1, 2]), _EMPTY_REQ_CTX)
+
+        # touch once more, now ready: promoted to T2
+        cpu_manager.touch(to_keys([1]), _EMPTY_REQ_CTX)
+        assert to_keys([1])[0] not in arc_policy.t1
+        assert to_keys([1])[0] in arc_policy.t2
+
+    def test_target_t1_size_adaptation_up_down_and_clamped(self):
+        """
+        B1 (ghost of T1) hit raises target_t1_size by max(1, |B2|/|B1|);
+        B2 hit lowers it by max(1, |B1|/|B2|); the target is clamped to
+        [0, cache_capacity].
+        """
+        cpu_manager, arc_policy = self._make_manager(enable_events=False)
+
+        # store [1, 2, 3, 4]; promote 1, 2 to T2 -> T1={3, 4}, T2={1, 2}
+        cpu_manager.prepare_store(to_keys([1, 2, 3, 4]), _EMPTY_REQ_CTX)
+        cpu_manager.complete_store(to_keys([1, 2, 3, 4]), _EMPTY_REQ_CTX)
+        cpu_manager.touch(to_keys([1, 2]), _EMPTY_REQ_CTX)
+
+        # storing 5 and 6 evicts 3, 4 from T1 -> B1 = {3, 4}
+        cpu_manager.prepare_store(to_keys([5]), _EMPTY_REQ_CTX)
+        cpu_manager.complete_store(to_keys([5]), _EMPTY_REQ_CTX)
+        cpu_manager.prepare_store(to_keys([6]), _EMPTY_REQ_CTX)
+        cpu_manager.complete_store(to_keys([6]), _EMPTY_REQ_CTX)
+        assert list(arc_policy.b1) == to_keys([3, 4])
+
+        # Force T2 evictions (direct assignment, as in
+        # test_t1_t2_eviction_policy): storing 7 and 8 evicts 1, 2 -> B2.
+        arc_policy.target_t1_size = 99.0
+        cpu_manager.prepare_store(to_keys([7]), _EMPTY_REQ_CTX)
+        cpu_manager.complete_store(to_keys([7]), _EMPTY_REQ_CTX)
+        cpu_manager.prepare_store(to_keys([8]), _EMPTY_REQ_CTX)
+        cpu_manager.complete_store(to_keys([8]), _EMPTY_REQ_CTX)
+        assert set(arc_policy.b2) == set(to_keys([1, 2]))
+
+        # B2 hit lowers the target by max(1, |B1|/|B2|) = max(1, 2/2) = 1
+        arc_policy.target_t1_size = 2.0
+        cpu_manager.touch(to_keys([1]), _EMPTY_REQ_CTX)
+        assert arc_policy.target_t1_size == 1.0
+
+        # B1 hit raises the target by max(1, |B2|/|B1|) = max(1, 2/2) = 1
+        cpu_manager.touch(to_keys([3]), _EMPTY_REQ_CTX)
+        assert arc_policy.target_t1_size == 2.0
+
+        # repeated B1 hits clamp the target at cache_capacity
+        for _ in range(6):
+            cpu_manager.touch(to_keys([3]), _EMPTY_REQ_CTX)
+        assert arc_policy.target_t1_size == 4.0
+
+        # B2 hits floor the target at 0
+        for _ in range(6):
+            cpu_manager.touch(to_keys([1]), _EMPTY_REQ_CTX)
+        assert arc_policy.target_t1_size == 0.0
+
+    def test_ghost_lists_capped_and_trim_oldest_first(self):
+        """
+        Each ghost list holds at most cache_capacity entries; once full, the
+        oldest (LRU-end) ghost is dropped and the most recent are retained.
+        """
+        cpu_manager, arc_policy = self._make_manager(num_blocks=2, enable_events=False)
+
+        def store(i: int):
+            cpu_manager.prepare_store(to_keys([i]), _EMPTY_REQ_CTX)
+            cpu_manager.complete_store(to_keys([i]), _EMPTY_REQ_CTX)
+
+        for i in (1, 2, 3, 4):
+            store(i)
+
+        # blocks 1, 2 were evicted while storing 3, 4 -> B1 saturated at
+        # cache_capacity, oldest first
+        assert list(arc_policy.b1) == to_keys([1, 2])
+        assert len(arc_policy.b1) == arc_policy.cache_capacity
+
+        # storing 5 evicts 3: B1 trims its oldest entry (1) and keeps 2, 3
+        store(5)
+        assert to_keys([1])[0] not in arc_policy.b1
+        assert list(arc_policy.b1) == to_keys([2, 3])
+        assert len(arc_policy.b1) <= arc_policy.cache_capacity
+        assert len(arc_policy.b2) <= arc_policy.cache_capacity
+
+    def test_arc_with_store_threshold_admission_and_ghost_learning(self):
+        """
+        With store_threshold=2 the admission filter sits in front of ARC:
+        blocks seen in fewer than two lookups are never inserted (so they
+        can never reach a ghost list either), admitted blocks enter T1, and
+        ghost-list learning keeps working for admitted blocks.
+        """
+        cpu_manager, arc_policy = self._make_manager(
+            num_blocks=2, enable_events=False, store_threshold=2
+        )
+
+        # one lookup is not enough: nothing is stored, all keys skipped
+        cpu_manager.lookup(to_key(1), _EMPTY_REQ_CTX)
+        prepare_store_output = cpu_manager.prepare_store(
+            to_keys([1, 2]), _EMPTY_REQ_CTX
+        )
+        assert prepare_store_output is not None
+        assert prepare_store_output.keys_to_store == []
+        assert len(arc_policy.t1) == 0
+
+        # second lookup admits block 1; block 2 stays unseen and filtered
+        cpu_manager.lookup(to_key(1), _EMPTY_REQ_CTX)
+        prepare_store_output = cpu_manager.prepare_store(
+            to_keys([1, 2]), _EMPTY_REQ_CTX
+        )
+        assert prepare_store_output is not None
+        assert prepare_store_output.keys_to_store == to_keys([1])
+        cpu_manager.complete_store(to_keys([1]), _EMPTY_REQ_CTX)
+
+        assert to_keys([1])[0] in arc_policy.t1
+        assert cpu_manager.lookup(to_key(2), _EMPTY_REQ_CTX) is LookupResult.MISS
+
+        # admitted blocks feed the ghost lists on eviction
+        for i in (2, 3, 4):
+            cpu_manager.lookup(to_key(i), _EMPTY_REQ_CTX)
+            cpu_manager.lookup(to_key(i), _EMPTY_REQ_CTX)
+            cpu_manager.prepare_store(to_keys([i]), _EMPTY_REQ_CTX)
+            cpu_manager.complete_store(to_keys([i]), _EMPTY_REQ_CTX)
+        assert list(arc_policy.b1) == to_keys([1, 2])
+
+        # a once-seen block is filtered and never enters T1 or B1
+        cpu_manager.lookup(to_key(5), _EMPTY_REQ_CTX)
+        prepare_store_output = cpu_manager.prepare_store(to_keys([5]), _EMPTY_REQ_CTX)
+        assert prepare_store_output is not None
+        assert prepare_store_output.keys_to_store == []
+        assert to_keys([5])[0] not in arc_policy.t1
+        assert to_keys([5])[0] not in arc_policy.b1
+
+        # ghost learning still adapts the target for admitted keys
+        target_before = arc_policy.target_t1_size
+        cpu_manager.touch(to_keys([1]), _EMPTY_REQ_CTX)
+        assert arc_policy.target_t1_size > target_before
+
+        # the skipped-store counter is reported through the stats
+        stats = cpu_manager.get_stats()
+        assert stats is not None
+        assert stats.reduce()[CPUOffloadingMetrics.STORES_SKIPPED] > 0
 
 
 def test_filter_reused_manager():

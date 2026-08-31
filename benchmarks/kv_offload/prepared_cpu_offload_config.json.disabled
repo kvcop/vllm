@@ -1,0 +1,34 @@
+{
+  "_status": "PREPARED, NOT ENABLED",
+  "_file_suffix": ".json.disabled keeps this out of any config loader; rename to enable after review",
+  "_purpose": "Candidate CPU KV-offload config for the Qwen3.8 stand: ARC eviction plus the store_threshold=2 admission filter. Backed only by the offline simulator in benchmarks/kv_offload/simulate_arc_admission.py -- no live trace has validated these values yet.",
+  "_prerequisites": [
+    "capture a real offload event trace (kv events) from the stand and replay it through the simulator before enabling",
+    "size cpu_bytes_to_use from measured host-memory headroom; the placeholder below is not measured",
+    "single-tier only: TieringOffloadingSpec rejects store_threshold >= 2"
+  ],
+  "kv-transfer-config": {
+    "kv_connector": "OffloadingConnector",
+    "kv_role": "kv_both",
+    "kv_connector_extra_config": {
+      "spec_name": "CPUOffloadingSpec",
+      "cpu_bytes_to_use": "PLACEHOLDER_SIZE_FROM_STAND_MEASUREMENT",
+      "eviction_policy": "arc",
+      "store_threshold": 2,
+      "max_tracker_size": 64000
+    }
+  },
+  "alternative_lru_baseline": {
+    "kv_connector_extra_config": {
+      "spec_name": "CPUOffloadingSpec",
+      "cpu_bytes_to_use": "PLACEHOLDER_SIZE_FROM_STAND_MEASUREMENT",
+      "eviction_policy": "lru",
+      "store_threshold": 2
+    }
+  },
+  "expected_observability": [
+    "vllm:kv_offload_stores_skipped increases while the filter is active",
+    "vllm:kv_offload_allocation_failure stays ~0; nonzero on recency-heavy traffic is the ARC batch-refusal path (see tests/v1/kv_offload/cpu/test_manager.py::test_evict_refuses_batch_when_preferred_list_exhausted)",
+    "vllm:kv_offload_cpu_cache_usage_perc below 1.0; sustained 1.0 means transfers are being dropped"
+  ]
+}

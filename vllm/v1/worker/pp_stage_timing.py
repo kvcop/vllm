@@ -34,6 +34,7 @@ regions are a single shared ``nullcontext`` and whose ``end_step`` is a
 no-op: no events are created, no samples are stored and nothing is logged.
 """
 
+import os
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterator
@@ -41,7 +42,6 @@ from contextlib import contextmanager, nullcontext
 
 import torch
 
-import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 
@@ -243,12 +243,12 @@ def maybe_make_pp_stage_timer(
     pp_world_size: int,
 ) -> PPStageTimerLike:
     """Return a live timer when the flag is on and PP is actually in use."""
-    if not envs.VLLM_PP_STAGE_TIMING or pp_world_size <= 1:
+    if not bool(int(os.getenv("VLLM_PP_STAGE_TIMING", "0"))) or pp_world_size <= 1:
         return NULL_PP_STAGE_TIMER
     timer = PPStageTimer(
         pp_rank,
         pp_world_size,
-        log_interval=envs.VLLM_PP_STAGE_TIMING_INTERVAL,
+        log_interval=int(os.getenv("VLLM_PP_STAGE_TIMING_INTERVAL", "100")),
         use_cuda_events=torch.cuda.is_available(),
     )
     logger.info(

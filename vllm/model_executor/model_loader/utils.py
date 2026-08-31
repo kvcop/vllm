@@ -37,6 +37,65 @@ from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 logger = init_logger(__name__)
 
 
+def _log_nvfp4_route_audit(model: nn.Module) -> None:
+    """Write one structured startup record per relevant linear module."""
+    import json
+    import os
+
+    from vllm.distributed import get_tensor_model_parallel_rank
+
+    if os.getenv("VLLM_NVFP4_ROUTE_AUDIT") != "1":
+        return
+
+    for module_name, module in model.named_modules():
+        method = getattr(module, "quant_method", None)
+        if method is None:
+            continue
+        kernel = getattr(method, "kernel", None)
+        if kernel is None:
+            # ModelOpt FP8 keeps the selected linear kernel under fp8_linear,
+            # unlike NVFP4 methods which use the generic kernel attribute.
+            kernel = getattr(method, "fp8_linear", None)
+        kernel_name = type(kernel).__name__ if kernel is not None else None
+        method_name = type(method).__name__
+        relevant = kernel_name in {
+            "W4A8NvFp4LinearKernel",
+            "MarlinFP8ScaledMMLinearKernel",
+            "MarlinNvFp4LinearKernel",
+        }
+        relevant = relevant or method_name == "UnquantizedLinearMethod"
+        if not relevant:
+            continue
+
+        is_w4a8 = kernel_name == "W4A8NvFp4LinearKernel"
+        config = getattr(kernel, "config", None)
+        partition_shape = (
+            (module.w4a8_k, module.w4a8_n)
+            if is_w4a8
+            else getattr(config, "partition_weight_shape", None)
+        )
+        full_shape = getattr(config, "full_weight_shape", None)
+        # Both Marlin routes are weight-only on SM89. Only W4A8 performs
+        # internal FP8-E4M3 activation quantization before its MMA.
+        input_quantization = "internal-fp8-e4m3" if is_w4a8 else "bf16-a16"
+        payload = {
+            "module": module_name,
+            "method": method_name,
+            "kernel": kernel_name,
+            "tp_rank": get_tensor_model_parallel_rank(),
+            "partition_weight_shape": list(partition_shape)
+            if partition_shape is not None
+            else None,
+            "full_weight_shape": list(full_shape)
+            if full_shape is not None
+            else None,
+            "input_quantization": input_quantization,
+            "tiled": getattr(module, "w4a8_has_tiles", None),
+            "fallback": getattr(module, "w4a8_has_fallback", None),
+        }
+        logger.info("NVFP4_ROUTE_AUDIT %s", json.dumps(payload, sort_keys=True))
+
+
 @instrument(span_name="Initialize model")
 def initialize_model(
     vllm_config: VllmConfig,
@@ -145,6 +204,8 @@ def process_weights_after_loading(
     # Model-level post-load hook, after the per-layer quant finalize.
     if hasattr(model, "process_weights_after_loading"):
         model.process_weights_after_loading()
+
+    _log_nvfp4_route_audit(model)
 
     # Needed for torchao model reloading via model.reload_weights
     # @kylesayrs @jerryzh168 this can be removed if callers move to `reload_weights`

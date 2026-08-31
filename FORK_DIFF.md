@@ -52,33 +52,32 @@ The Qwen3.8 chat template is intentionally tracked by the deployment repository
 as an explicit asset. It should be moved into this fork only if the runtime
 image, rather than the service bundle, becomes its owner.
 
-## Separate DFlash runtime line
+## Maintained DFlash2/lookup stack
 
-DFlash changes must remain on a named branch derived from this exact base. They
-must not be folded into the primary native-MTP line merely because both were
-measured on the same stand.
+The accepted DFlash2/lookup stack is committed in `qwen38-v0271-fork`. It is
+still opt-in: the V2 runner selects it only for a draft checkpoint whose
+architecture is `DFlash2DraftModel`. Keeping the implementation in this branch
+means a source-file replacement shows up as a Git diff instead of erasing an
+ad-hoc-only patch with no durable reference.
 
-The preserved source set is:
+The maintained source set is:
 
-- the frozen E336 DFlash2/lookup backport;
-- E343 long-lookup and speculative-decode attention support where still
-  required by the selected profile;
+- the frozen E336/E343 DFlash2 model, selector, lookup, sampling and runner
+  integration;
 - the E345 rejection-sampler allocation fix;
-- registered start-time environment controls that affect compiled graphs or
-  speculative-decode behavior.
+- the native-MTP PP draft relay, auxiliary-hidden-state relay and PP memory
+  warmup required by the combined PP target.
 
 Source bundles live under
 `../vllm_benchmark/specs/007-qwen38-model-evaluation/ops/` as
 `e341-*`, `e343-*` and `e345-dflash-sampler-memory-v0271.patch`.
 
-The `qwen38-v0271-dflash-pp2-e358` branch imports the frozen DFlash2 model,
-selector, lookup, sampling and runner integration from the E336/E343 runtime
-line, plus the E345 rejection-sampler allocation fix. Its runner merge also
-retains the native-MTP PP draft relay, the auxiliary-hidden-state relay from
-`13b123c7c7` and the PP memory warmup from `1ed495cbe`. It deliberately does not
-import the optional E343 split-KV attention backend or speed-knob registry: the
-selected `k7`/FP8-KV profile cannot use the bf16-only attention path and does
-not require those compile-cache controls.
+The accepted source commits were `d9cc8381ad` and `242f1e2c8b` on
+`qwen38-v0271-dflash-pp2-e358`. They are preserved on this branch as
+`d0b986c9f0` and `d4036db3e1`. The integration deliberately excludes the
+optional E343 split-KV attention backend and speed-knob registry. The selected
+`k7`/FP8-KV profile cannot use the bf16-only attention path and does not require
+those compile-cache controls.
 
 ## Experiments that are not default fork behavior
 

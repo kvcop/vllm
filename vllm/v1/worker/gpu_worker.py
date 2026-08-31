@@ -456,6 +456,27 @@ class Worker(WorkerBase):
         with set_current_vllm_config(self.vllm_config):
             self.model_runner.reload_weights(*args, **kwargs)
 
+    def _warmup_pp_communication(self) -> None:
+        """Exercise the PP relay so its NCCL buffers exist before profiling.
+
+        `execute_model` relays intermediate tensors between PP stages with
+        p2p ops on the PP device group, whose NCCL communicator is created
+        lazily on first use. Without a warmup that first use happens on the
+        first forward pass, after this method has already sized the KV
+        cache, so the communicator's GPU buffers are missing from the
+        profiled non-KV memory. Pair one small send/recv across each stage
+        boundary while the profiler can still account for them.
+        """
+        pp_group = get_pp_group()
+        if pp_group.world_size <= 1:
+            return
+        dummy = {"pp_warmup": torch.zeros(1, device=self.device)}
+        for src in range(pp_group.world_size - 1):
+            if pp_group.rank_in_group == src:
+                pp_group.send_tensor_dict(dummy, dst=src + 1)
+            elif pp_group.rank_in_group == src + 1:
+                pp_group.recv_tensor_dict(src=src)
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
@@ -494,6 +515,10 @@ class Worker(WorkerBase):
                 self.model_config.multimodal_config,
                 getattr(self.parallel_config, "_api_process_count", 1),
             )
+
+        # Allocate the PP relay's lazily created NCCL buffers before the
+        # profiled window so KV cache sizing accounts for them.
+        self._warmup_pp_communication()
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.

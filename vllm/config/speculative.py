@@ -1255,10 +1255,12 @@ class SpeculativeConfig:
     ) -> ParallelConfig:
         """Create a parallel config for use by the draft worker.
 
-        This is mostly a copy of the target parallel config, except the tp_size.
+        This is mostly a copy of the target parallel config, except the tp_size
+        and pp_size. The V2 runner builds the complete draft model on the target
+        rank that samples tokens; the draft model itself is not pipelined.
         """
         draft_parallel_config = ParallelConfig(
-            pipeline_parallel_size=target_parallel_config.pipeline_parallel_size,
+            pipeline_parallel_size=1,
             tensor_parallel_size=speculative_draft_tensor_parallel_size,
             distributed_executor_backend=target_parallel_config.distributed_executor_backend,
             max_parallel_loading_workers=target_parallel_config.max_parallel_loading_workers,

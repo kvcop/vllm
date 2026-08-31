@@ -7,6 +7,7 @@ from typing import Any, cast
 import torch
 from torch import nn
 
+from vllm.config import ParallelConfig, SpeculativeConfig
 from vllm.model_executor.models.interfaces import supports_pp
 from vllm.model_executor.models.qwen3_5_mtp import (
     Qwen3_5MTP,
@@ -41,8 +42,21 @@ class _FinalNorm(nn.Module):
         return hidden_states + residual, None
 
 
-def test_qwen3_5_mtp_declares_pipeline_support():
-    assert supports_pp(Qwen3_5MTP)
+def test_qwen3_5_mtp_draft_is_single_stage_under_target_pp(monkeypatch):
+    monkeypatch.setattr("vllm.config.parallel.current_platform.device_count", lambda: 4)
+    target_parallel_config = ParallelConfig(
+        pipeline_parallel_size=2,
+        tensor_parallel_size=2,
+    )
+
+    draft_parallel_config = SpeculativeConfig.create_draft_parallel_config(
+        target_parallel_config,
+        speculative_draft_tensor_parallel_size=2,
+    )
+
+    assert draft_parallel_config.pipeline_parallel_size == 1
+    assert draft_parallel_config.tensor_parallel_size == 2
+    assert not supports_pp(Qwen3_5MTP)
 
 
 def test_qwen3_5_mtp_predictor_runs_whole_draft_on_owning_rank():

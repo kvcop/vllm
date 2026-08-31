@@ -1274,6 +1274,46 @@ def test_reset_connector_cache_no_connector_is_no_op_success():
     assert scheduler.reset_prefix_cache(reset_connector=True) is True
 
 
+def test_v2_pp_spec_decode_waits_for_sampled_token_relay(monkeypatch):
+    monkeypatch.setattr("vllm.config.parallel.current_platform.device_count", lambda: 2)
+    pp_size = 2
+    scheduler = create_scheduler(
+        async_scheduling=False,
+        num_speculative_tokens=3,
+        pipeline_parallel_size=pp_size,
+        use_v2_model_runner=True,
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=1)
+    scheduler.add_request(request)
+
+    prefill_output = scheduler.schedule()
+    prefill_step = scheduler.current_step
+    assert not request.is_prefill_chunk
+    assert request.next_decode_eligible_step == prefill_step + pp_size
+
+    scheduler.update_draft_token_ids(DraftTokenIds([request.request_id], [[1, 2, 3]]))
+
+    next_output = scheduler.schedule()
+    assert scheduler.current_step == prefill_step + 1
+    assert request.request_id not in next_output.num_scheduled_tokens
+
+    scheduler.update_from_output(
+        prefill_output,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[42]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+    eligible_output = scheduler.schedule()
+    assert scheduler.current_step == prefill_step + pp_size
+    assert eligible_output.num_scheduled_tokens[request.request_id] == 4
+
+
 # Note - these test cases mirror some of those in test_rejection_sampler.py
 @pytest.mark.parametrize(
     "spec_tokens,output_tokens,expected",

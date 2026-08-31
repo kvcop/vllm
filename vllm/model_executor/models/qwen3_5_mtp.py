@@ -3,7 +3,6 @@
 """Inference-only Qwen3_5 MTP model."""
 
 from collections.abc import Iterable
-from typing import ClassVar, Literal
 
 import torch
 from torch import nn
@@ -206,8 +205,6 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
     the target's final hidden state and does not use Eagle3 auxiliary states.
     """
 
-    supports_pp: ClassVar[Literal[True]] = True
-
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -246,14 +243,6 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
             )
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
-
-    def make_empty_intermediate_tensors(
-        self,
-        batch_size: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> IntermediateTensors:
-        return self.model.make_empty_intermediate_tensors(batch_size, dtype, device)
 
     def embed_input_ids(
         self,

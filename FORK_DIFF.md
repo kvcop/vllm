@@ -57,6 +57,11 @@ an empty hash vector. `request_seq` is gap-free among emitted accesses for one
 engine restart changes the identity and starts a new sequence. A skip-reading
 request still emits with `lookup_performed=false`: it bypasses maximal-prefix
 lookup and hit accounting but still participates in the policy `touch` path.
+`benchmarks/kv_offload/simulate_arc_admission.py --request-access-jsonl`
+consumes this v1 wire contract fail-closed. It reconstructs replayed publisher
+frames by `(seq, event_idx)`, validates gap-free request order and complete KV
+groups independently per run/engine/DP stream, and never includes opaque hashes
+in its report.
 
 The Qwen3.8 chat template is intentionally tracked by the deployment repository
 as an explicit asset. It should be moved into this fork only if the runtime

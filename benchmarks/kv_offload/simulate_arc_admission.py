@@ -29,14 +29,31 @@ here a slight underestimate, and leaves the threshold-0 runs unchanged).
 The traces are fully deterministic (no RNG). Run:
 
     .venv/bin/python -m benchmarks.kv_offload.simulate_arc_admission
+
+An opt-in live observer trace can replace the synthetic families:
+
+    .venv/bin/python -m benchmarks.kv_offload.simulate_arc_admission \
+        --request-access-jsonl trace.jsonl --json report.json
+
+Live input is fail-closed: privacy-bearing/unknown fields, control boundaries,
+decode-error markers, request-sequence gaps, incomplete KV groups, and unknown
+schemas abort replay. ``lookup_performed=false`` skips maximal-prefix lookup
+and hit accounting but preserves the request's policy touch and store phases.
 """
 
 import argparse
 import json
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, TypeAlias, cast
 
-from vllm.v1.kv_offload.base import LookupResult, ReqContext, make_offload_key
+from vllm.v1.kv_offload.base import (
+    LookupResult,
+    OffloadKey,
+    ReqContext,
+    make_offload_key,
+)
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 
 HOT_SET_SIZE = 8
@@ -44,6 +61,108 @@ HOT_SET_SIZE = 8
 
 CACHE_NUM_BLOCKS = 32
 """Simulated CPU tier capacity in blocks."""
+
+TraceBlock: TypeAlias = int | tuple[int, int]
+"""Synthetic id, or ``(group_idx, opaque terminal hash)`` from live events."""
+
+StreamIdentity: TypeAlias = tuple[int, str, int]
+"""``(run_index, engine_id, data_parallel_rank)`` of one scheduler stream."""
+
+
+class RequestAccessTraceError(ValueError):
+    """A request-access JSONL trace is incomplete, unsafe, or ambiguous."""
+
+    @classmethod
+    def at_line(cls, line_number: int, message: str) -> "RequestAccessTraceError":
+        return cls(f"line {line_number}: {message}")
+
+
+@dataclass(frozen=True)
+class TraceRequest:
+    """One replay request, including whether external lookup participated."""
+
+    blocks: tuple[TraceBlock, ...]
+    lookup_performed: bool = True
+
+
+@dataclass(frozen=True)
+class RequestAccessStream:
+    """Validated accesses from one scheduler stream in request order."""
+
+    identity: StreamIdentity
+    group_indices: tuple[int, ...]
+    requests: tuple[TraceRequest, ...]
+
+
+@dataclass(frozen=True)
+class RequestAccessTrace:
+    """Fail-closed live trace ready for independent per-stream replay."""
+
+    streams: tuple[RequestAccessStream, ...]
+
+    @property
+    def request_count(self) -> int:
+        return sum(len(stream.requests) for stream in self.streams)
+
+    @property
+    def block_access_count(self) -> int:
+        return sum(
+            len(request.blocks)
+            for stream in self.streams
+            for request in stream.requests
+            if request.lookup_performed
+        )
+
+    @property
+    def touched_block_count(self) -> int:
+        return sum(
+            len(request.blocks)
+            for stream in self.streams
+            for request in stream.requests
+        )
+
+
+@dataclass(frozen=True)
+class _RequestAccessRow:
+    """One validated row before publisher-order reconstruction."""
+
+    line_number: int
+    seq: int
+    event_idx: int
+    run_index: int
+    engine_id: str
+    data_parallel_rank: int
+    request_seq: int
+    lookup_performed: bool
+    group_idx: int
+    terminal_block_hashes: tuple[int, ...]
+
+    @property
+    def stream_identity(self) -> StreamIdentity:
+        return (self.run_index, self.engine_id, self.data_parallel_rank)
+
+    @property
+    def publisher_position(self) -> tuple[int, int]:
+        return (self.seq, self.event_idx)
+
+
+_REQUEST_ACCESS_FIELDS = {
+    "seq",
+    "event_idx",
+    "run_index",
+    "ts",
+    "kind",
+    "schema_version",
+    "engine_id",
+    "data_parallel_rank",
+    "request_seq",
+    "pass_index",
+    "lookup_performed",
+    "group_idx",
+    "terminal_block_hashes",
+}
+_REJECTED_TRACE_KINDS = {"sequence_reset", "cleared", "decode_error"}
+_IGNORED_RESIDENCY_KINDS = {"stored", "removed"}
 
 
 def _ctx() -> ReqContext:
@@ -79,16 +198,27 @@ class SimResult:
         return self.hits / self.accesses if self.accesses else 0.0
 
 
-def _chunked(keys: list[int], size: int) -> Iterator[list[int]]:
+def _chunked(keys: list[OffloadKey], size: int) -> Iterator[list[OffloadKey]]:
     for start in range(0, len(keys), size):
         yield keys[start : start + size]
 
 
-def run_trace(trace: list[list[int]], config: SimConfig) -> SimResult:
+def _offload_key(block: TraceBlock) -> OffloadKey:
+    if isinstance(block, tuple):
+        group_idx, terminal_hash = block
+        return make_offload_key(str(terminal_hash).encode(), group_idx)
+    return make_offload_key(str(block).encode(), 0)
+
+
+def run_trace(
+    trace: Sequence[Sequence[TraceBlock] | TraceRequest], config: SimConfig
+) -> SimResult:
     """Replay ``trace`` through a real CPUOffloadingManager.
 
     Args:
-        trace: Requests as lists of integer block ids, in arrival order.
+        trace: Requests as block ids in arrival order. Live request-access
+            keys are represented by ``(group_idx, terminal_hash)`` pairs and
+            carry a request-wide external-lookup participation flag.
         config: Policy and admission-filter configuration.
 
     Returns:
@@ -102,30 +232,36 @@ def run_trace(trace: list[list[int]], config: SimConfig) -> SimResult:
     )
     ctx = _ctx()
     result = SimResult()
-    stored: set[int] = set()
+    stored: set[OffloadKey] = set()
 
     for request in trace:
-        keys = [make_offload_key(str(block).encode(), 0) for block in request]
+        blocks: Sequence[TraceBlock]
+        if isinstance(request, TraceRequest):
+            blocks = request.blocks
+            lookup_performed = request.lookup_performed
+        else:
+            blocks = request
+            lookup_performed = True
+        keys = [_offload_key(block) for block in blocks]
 
         # 1. maximal-prefix lookup: break at the first MISS, exactly like
         #    _maximal_prefix_lookup in the offloading scheduler.
-        for key in keys:
-            match manager.lookup(key, ctx):
-                case LookupResult.HIT | LookupResult.HIT_PENDING:
-                    result.hits += 1
-                case LookupResult.MISS:
-                    break
-        result.accesses += len(keys)
+        if lookup_performed:
+            for key in keys:
+                match manager.lookup(key, ctx):
+                    case LookupResult.HIT | LookupResult.HIT_PENDING:
+                        result.hits += 1
+                    case LookupResult.MISS:
+                        break
+            result.accesses += len(keys)
 
         # 2. touch every key of the request (production _touch).
         manager.touch(keys, ctx)
 
         # 3. store blocks not currently in the cache, chunked to capacity.
-        to_store = [block for block in request if block not in stored]
+        to_store = [key for key in keys if key not in stored]
         for chunk in _chunked(to_store, config.num_blocks):
-            output = manager.prepare_store(
-                [make_offload_key(str(block).encode(), 0) for block in chunk], ctx
-            )
+            output = manager.prepare_store(chunk, ctx)
             if output is None:
                 # eviction could not be satisfied (soft failure: the
                 # scheduler retries these chunks on a later batch)
@@ -137,9 +273,9 @@ def run_trace(trace: list[list[int]], config: SimConfig) -> SimResult:
                 continue
             manager.complete_store(output.keys_to_store, ctx)
             result.stores += len(output.keys_to_store)
-            stored.update(int(key[:-4]) for key in output.keys_to_store)
+            stored.update(output.keys_to_store)
             for key in output.evicted_keys:
-                stored.discard(int(key[:-4]))
+                stored.discard(key)
             result.evictions += len(output.evicted_keys)
 
         result.stores_skipped += manager.stores_skipped_in_current_batch
@@ -148,6 +284,301 @@ def run_trace(trace: list[list[int]], config: SimConfig) -> SimResult:
         result.hit_rate_history.append(result.hit_rate)
 
     return result
+
+
+def _require_trace(condition: bool, line_number: int, message: str) -> None:
+    if not condition:
+        raise RequestAccessTraceError.at_line(line_number, message)
+
+
+def _required_int(row: dict[str, Any], field_name: str, line_number: int) -> int:
+    value = row.get(field_name)
+    _require_trace(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0,
+        line_number,
+        f"{field_name} must be a non-negative int",
+    )
+    return cast(int, value)
+
+
+def _parse_request_access_row(
+    row: dict[str, Any], line_number: int
+) -> _RequestAccessRow:
+    unexpected = sorted(set(row) - _REQUEST_ACCESS_FIELDS)
+    missing = sorted(_REQUEST_ACCESS_FIELDS - set(row))
+    _require_trace(
+        not unexpected,
+        line_number,
+        f"unexpected or privacy-sensitive fields: {unexpected}",
+    )
+    _require_trace(not missing, line_number, f"missing fields: {missing}")
+    _require_trace(
+        row.get("schema_version") == 1,
+        line_number,
+        "unsupported request-access schema",
+    )
+    _require_trace(
+        row.get("pass_index") == 0,
+        line_number,
+        "unsupported request-access pass",
+    )
+    lookup_performed = row.get("lookup_performed")
+    _require_trace(
+        isinstance(lookup_performed, bool),
+        line_number,
+        "lookup_performed must be bool",
+    )
+    engine_id = row.get("engine_id")
+    _require_trace(
+        isinstance(engine_id, str) and bool(engine_id),
+        line_number,
+        "engine_id must be a non-empty string",
+    )
+    timestamp = row.get("ts")
+    _require_trace(
+        isinstance(timestamp, int | float) and not isinstance(timestamp, bool),
+        line_number,
+        "ts must be numeric",
+    )
+    raw_hashes = row.get("terminal_block_hashes")
+    _require_trace(
+        isinstance(raw_hashes, list),
+        line_number,
+        "terminal_block_hashes must be a list",
+    )
+    hashes = cast(list[Any], raw_hashes)
+    _require_trace(
+        all(isinstance(value, int) and not isinstance(value, bool) for value in hashes),
+        line_number,
+        "terminal_block_hashes must contain integers",
+    )
+    return _RequestAccessRow(
+        line_number=line_number,
+        seq=_required_int(row, "seq", line_number),
+        event_idx=_required_int(row, "event_idx", line_number),
+        run_index=_required_int(row, "run_index", line_number),
+        engine_id=cast(str, engine_id),
+        data_parallel_rank=_required_int(row, "data_parallel_rank", line_number),
+        request_seq=_required_int(row, "request_seq", line_number),
+        lookup_performed=cast(bool, lookup_performed),
+        group_idx=_required_int(row, "group_idx", line_number),
+        terminal_block_hashes=tuple(cast(list[int], hashes)),
+    )
+
+
+def _parse_jsonl(path: Path) -> list[_RequestAccessRow]:
+    access_rows: list[_RequestAccessRow] = []
+    with path.open(encoding="utf-8") as source:
+        for line_number, raw in enumerate(source, start=1):
+            if not raw.strip():
+                continue
+            try:
+                row = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise RequestAccessTraceError.at_line(
+                    line_number, f"invalid JSON: {exc.msg}"
+                ) from exc
+            _require_trace(
+                isinstance(row, dict), line_number, "row must be a JSON object"
+            )
+            row = cast(dict[str, Any], row)
+            kind = row.get("kind")
+            _require_trace(isinstance(kind, str), line_number, "kind must be a string")
+            if kind in _REJECTED_TRACE_KINDS:
+                raise RequestAccessTraceError.at_line(
+                    line_number, f"trace contains forbidden {kind!r} boundary"
+                )
+            if kind in _IGNORED_RESIDENCY_KINDS:
+                continue
+            _require_trace(
+                kind == "request_access",
+                line_number,
+                f"unknown trace row kind: {kind!r}",
+            )
+            access_rows.append(_parse_request_access_row(row, line_number))
+    if not access_rows:
+        raise RequestAccessTraceError("trace contains no request_access rows")
+    return access_rows
+
+
+def _build_request_access_streams(
+    rows: list[_RequestAccessRow],
+) -> tuple[RequestAccessStream, ...]:
+    rows_by_stream: dict[StreamIdentity, list[_RequestAccessRow]] = {}
+    stream_order: list[StreamIdentity] = []
+    for row in rows:
+        if row.stream_identity not in rows_by_stream:
+            rows_by_stream[row.stream_identity] = []
+            stream_order.append(row.stream_identity)
+        rows_by_stream[row.stream_identity].append(row)
+
+    streams: list[RequestAccessStream] = []
+    for identity in stream_order:
+        unsorted_rows = rows_by_stream[identity]
+        seen_positions: dict[tuple[int, int], int] = {}
+        for row in unsorted_rows:
+            previous_line = seen_positions.setdefault(
+                row.publisher_position, row.line_number
+            )
+            _require_trace(
+                previous_line == row.line_number,
+                row.line_number,
+                f"duplicate publisher position (first seen at line {previous_line})",
+            )
+        stream_rows = sorted(unsorted_rows, key=lambda row: row.publisher_position)
+        _require_trace(
+            stream_rows[0].request_seq == 0,
+            stream_rows[0].line_number,
+            "request_seq must start at zero for a complete stream",
+        )
+        requests: list[TraceRequest] = []
+        request_groups: list[tuple[int, ...]] = []
+        request_lines: list[int] = []
+        current_seq: int | None = None
+        current_line = 0
+        current_lookup_performed = True
+        current_groups: list[int] = []
+        current_keys: list[tuple[int, int]] = []
+
+        for row in stream_rows:
+            if current_seq is None or row.request_seq != current_seq:
+                if current_seq is not None:
+                    _require_trace(
+                        row.request_seq == current_seq + 1,
+                        row.line_number,
+                        "request_seq must be gap-free and must not reset",
+                    )
+                    request_groups.append(tuple(current_groups))
+                    requests.append(
+                        TraceRequest(
+                            blocks=tuple(current_keys),
+                            lookup_performed=current_lookup_performed,
+                        )
+                    )
+                    request_lines.append(current_line)
+                current_seq = row.request_seq
+                current_line = row.line_number
+                current_lookup_performed = row.lookup_performed
+                current_groups = []
+                current_keys = []
+            _require_trace(
+                row.lookup_performed == current_lookup_performed,
+                row.line_number,
+                "lookup_performed must agree across all groups of one request",
+            )
+            _require_trace(
+                row.group_idx not in current_groups,
+                row.line_number,
+                "duplicate group_idx in one request",
+            )
+            current_groups.append(row.group_idx)
+            current_keys.extend(
+                (row.group_idx, terminal_hash)
+                for terminal_hash in row.terminal_block_hashes
+            )
+        request_groups.append(tuple(current_groups))
+        requests.append(
+            TraceRequest(
+                blocks=tuple(current_keys),
+                lookup_performed=current_lookup_performed,
+            )
+        )
+        request_lines.append(current_line)
+
+        all_groups = set().union(*(set(groups) for groups in request_groups))
+        canonical_groups = request_groups[0]
+        expected_groups = tuple(range(max(all_groups) + 1))
+        _require_trace(
+            canonical_groups == expected_groups,
+            stream_rows[0].line_number,
+            "KV group indices must be complete, ordered, and zero-based",
+        )
+        _require_trace(
+            set(canonical_groups) == all_groups,
+            stream_rows[0].line_number,
+            "first request does not contain the complete group set",
+        )
+        for index, groups in enumerate(request_groups):
+            _require_trace(
+                groups == canonical_groups,
+                request_lines[index],
+                "request group set or group order is incomplete/inconsistent",
+            )
+        streams.append(
+            RequestAccessStream(
+                identity=identity,
+                group_indices=canonical_groups,
+                requests=tuple(requests),
+            )
+        )
+    return tuple(streams)
+
+
+def load_request_access_trace(path: Path) -> RequestAccessTrace:
+    """Load an observer JSONL trace, rejecting unsafe or incomplete input.
+
+    Replayed frames may appear late in the file, so access rows are restored to
+    publisher order by ``(run_index, seq, event_idx)``. Request sequences are
+    then checked independently for each run/engine/DP stream.
+    """
+    return RequestAccessTrace(streams=_build_request_access_streams(_parse_jsonl(path)))
+
+
+def _merge_result(target: SimResult, source: SimResult) -> None:
+    target.accesses += source.accesses
+    target.hits += source.hits
+    target.stores += source.stores
+    target.store_batches_refused += source.store_batches_refused
+    target.store_batches_filtered += source.store_batches_filtered
+    target.evictions += source.evictions
+    target.stores_skipped += source.stores_skipped
+    # Streams have independent managers; the sum is their concurrent footprint.
+    target.admitted_blocks_peak += source.admitted_blocks_peak
+
+
+def run_request_access_trace(trace: RequestAccessTrace, config: SimConfig) -> SimResult:
+    """Replay each engine/DP stream through an independent manager."""
+    result = SimResult()
+    for stream in trace.streams:
+        stream_result = run_trace(list(stream.requests), config)
+        _merge_result(result, stream_result)
+    return result
+
+
+def report_request_access_trace(
+    trace: RequestAccessTrace,
+    configs: dict[str, SimConfig] | None = None,
+) -> dict[str, Any]:
+    """Build a hash-free LRU/ARC comparison for a validated live trace."""
+    if configs is None:
+        configs = {
+            "lru+thr0": SimConfig(cache_policy="lru", store_threshold=0),
+            "arc+thr0": SimConfig(cache_policy="arc", store_threshold=0),
+            "lru+thr2": SimConfig(cache_policy="lru", store_threshold=2),
+            "arc+thr2": SimConfig(cache_policy="arc", store_threshold=2),
+        }
+    report: dict[str, Any] = {
+        "trace_contract": "request-access-v1",
+        "streams": len(trace.streams),
+        "requests": trace.request_count,
+        "block_accesses": trace.block_access_count,
+        "blocks_touched": trace.touched_block_count,
+        "group_counts": sorted(len(stream.group_indices) for stream in trace.streams),
+        "configs": {},
+    }
+    for label, config in configs.items():
+        result = run_request_access_trace(trace, config)
+        report["configs"][label] = {
+            "hit_rate": round(result.hit_rate, 4),
+            "hits": result.hits,
+            "stores": result.stores,
+            "evictions": result.evictions,
+            "stores_skipped": result.stores_skipped,
+            "store_batches_refused": result.store_batches_refused,
+            "store_batches_filtered": result.store_batches_filtered,
+            "admitted_blocks_peak_sum": result.admitted_blocks_peak,
+        }
+    return report
 
 
 def growing_agent_sessions(
@@ -291,9 +722,21 @@ def run_all(configs: dict[str, SimConfig] | None = None) -> dict:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--json", help="Optional path to write the report as JSON.")
+    parser.add_argument(
+        "--request-access-jsonl",
+        type=Path,
+        help=(
+            "Replay a fail-closed request_access observer trace instead of "
+            "synthetic traces."
+        ),
+    )
     args = parser.parse_args()
 
-    report = run_all()
+    if args.request_access_jsonl:
+        trace = load_request_access_trace(args.request_access_jsonl)
+        report = {"observed_request_access": report_request_access_trace(trace)}
+    else:
+        report = run_all()
     for trace_name, trace_report in report.items():
         print(
             f"\n=== {trace_name} ({trace_report['requests']} requests, "

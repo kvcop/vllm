@@ -10,11 +10,19 @@ a silent behavior shift. The numbers describe the synthetic traces only --
 they are not claims about production hit rates.
 """
 
+import json
+from pathlib import Path
+
+import pytest
+
 from benchmarks.kv_offload.simulate_arc_admission import (
     CACHE_NUM_BLOCKS,
     TRACE_FAMILIES,
+    RequestAccessTraceError,
     growing_agent_sessions,
+    load_request_access_trace,
     one_shot_echo_scans,
+    report_request_access_trace,
     returning_long_session,
     run_all,
 )
@@ -146,3 +154,224 @@ def test_threshold_2_serializes_admission_along_the_lookup_frontier():
     assert session["lru+thr2"]["stores"] == 6  # 6 hot-prefix/frontier blocks
     assert session["lru+thr2"]["hits"] < session["lru+thr0"]["hits"]
     assert CACHE_NUM_BLOCKS == 32
+
+
+def _access_row(
+    *,
+    seq: int,
+    event_idx: int,
+    request_seq: int,
+    group_idx: int,
+    hashes: list[int],
+    engine_id: str = "engine-a",
+    data_parallel_rank: int = 0,
+    run_index: int = 0,
+    lookup_performed: bool = True,
+) -> dict:
+    return {
+        "seq": seq,
+        "event_idx": event_idx,
+        "run_index": run_index,
+        "ts": float(seq),
+        "kind": "request_access",
+        "schema_version": 1,
+        "engine_id": engine_id,
+        "data_parallel_rank": data_parallel_rank,
+        "request_seq": request_seq,
+        "pass_index": 0,
+        "lookup_performed": lookup_performed,
+        "group_idx": group_idx,
+        "terminal_block_hashes": hashes,
+    }
+
+
+def _write_jsonl(path: Path, rows: list[dict]) -> Path:
+    path.write_text("".join(f"{json.dumps(row)}\n" for row in rows))
+    return path
+
+
+def test_request_access_trace_restores_publisher_and_request_order(tmp_path: Path):
+    high_hash = 901_234_567_890_123
+    rows = [
+        # Recovered publisher frames are deliberately written out of order.
+        _access_row(
+            seq=11,
+            event_idx=1,
+            request_seq=1,
+            group_idx=1,
+            hashes=[high_hash + 3],
+        ),
+        _access_row(
+            seq=10,
+            event_idx=1,
+            request_seq=0,
+            group_idx=1,
+            hashes=[high_hash + 1],
+        ),
+        _access_row(
+            seq=11,
+            event_idx=0,
+            request_seq=1,
+            group_idx=0,
+            hashes=[high_hash, high_hash + 2],
+        ),
+        _access_row(
+            seq=10,
+            event_idx=0,
+            request_seq=0,
+            group_idx=0,
+            hashes=[high_hash],
+        ),
+        # A second publisher may reuse seq/event_idx; validation is per stream.
+        _access_row(
+            seq=10,
+            event_idx=0,
+            request_seq=0,
+            group_idx=0,
+            hashes=[high_hash + 4],
+            engine_id="engine-b",
+            data_parallel_rank=1,
+        ),
+    ]
+    trace = load_request_access_trace(_write_jsonl(tmp_path / "trace.jsonl", rows))
+
+    assert len(trace.streams) == 2
+    first = trace.streams[0]
+    assert first.group_indices == (0, 1)
+    assert tuple(request.blocks for request in first.requests) == (
+        ((0, high_hash), (1, high_hash + 1)),
+        ((0, high_hash), (0, high_hash + 2), (1, high_hash + 3)),
+    )
+    assert tuple(request.blocks for request in trace.streams[1].requests) == (
+        ((0, high_hash + 4),),
+    )
+
+    summary = report_request_access_trace(trace)
+    assert summary["requests"] == 3
+    assert summary["block_accesses"] == 6
+    assert summary["blocks_touched"] == 6
+    assert summary["group_counts"] == [1, 2]
+    # Opaque hashes are accepted only as replay keys, never copied to a report.
+    assert str(high_hash) not in json.dumps(summary)
+
+
+def test_request_access_trace_rejects_incomplete_group_set(tmp_path: Path):
+    rows = [
+        _access_row(seq=1, event_idx=0, request_seq=0, group_idx=0, hashes=[10]),
+        _access_row(seq=1, event_idx=1, request_seq=0, group_idx=1, hashes=[20]),
+        _access_row(seq=2, event_idx=0, request_seq=1, group_idx=0, hashes=[10]),
+    ]
+
+    with pytest.raises(RequestAccessTraceError, match="incomplete/inconsistent"):
+        load_request_access_trace(_write_jsonl(tmp_path / "trace.jsonl", rows))
+
+
+def test_request_access_trace_rejects_request_sequence_gap(tmp_path: Path):
+    rows = [
+        _access_row(seq=1, event_idx=0, request_seq=0, group_idx=0, hashes=[10]),
+        _access_row(seq=2, event_idx=0, request_seq=2, group_idx=0, hashes=[20]),
+    ]
+
+    with pytest.raises(RequestAccessTraceError, match="gap-free"):
+        load_request_access_trace(_write_jsonl(tmp_path / "trace.jsonl", rows))
+
+
+def test_request_access_trace_rejects_incomplete_prefix_of_request_sequence(
+    tmp_path: Path,
+):
+    rows = [
+        _access_row(seq=2, event_idx=0, request_seq=1, group_idx=0, hashes=[20]),
+    ]
+
+    with pytest.raises(RequestAccessTraceError, match="start at zero"):
+        load_request_access_trace(_write_jsonl(tmp_path / "trace.jsonl", rows))
+
+
+def test_touch_only_request_skips_lookup_accounting_but_still_updates_policy(
+    tmp_path: Path,
+):
+    rows = [
+        _access_row(seq=1, event_idx=0, request_seq=0, group_idx=0, hashes=[10]),
+        _access_row(
+            seq=2,
+            event_idx=0,
+            request_seq=1,
+            group_idx=0,
+            hashes=[10],
+            lookup_performed=False,
+        ),
+        _access_row(seq=3, event_idx=0, request_seq=2, group_idx=0, hashes=[10]),
+    ]
+    trace = load_request_access_trace(_write_jsonl(tmp_path / "trace.jsonl", rows))
+
+    assert [request.lookup_performed for request in trace.streams[0].requests] == [
+        True,
+        False,
+        True,
+    ]
+    summary = report_request_access_trace(trace)
+    assert summary["block_accesses"] == 2
+    assert summary["blocks_touched"] == 3
+    assert summary["configs"]["lru+thr0"]["hits"] == 1
+
+
+def test_request_access_trace_rejects_mixed_lookup_semantics_within_request(
+    tmp_path: Path,
+):
+    rows = [
+        _access_row(seq=1, event_idx=0, request_seq=0, group_idx=0, hashes=[10]),
+        _access_row(
+            seq=1,
+            event_idx=1,
+            request_seq=0,
+            group_idx=1,
+            hashes=[20],
+            lookup_performed=False,
+        ),
+    ]
+
+    with pytest.raises(RequestAccessTraceError, match="agree across all groups"):
+        load_request_access_trace(_write_jsonl(tmp_path / "trace.jsonl", rows))
+
+
+@pytest.mark.parametrize("kind", ["sequence_reset", "cleared", "decode_error"])
+def test_request_access_trace_rejects_boundaries_and_decode_errors(
+    tmp_path: Path, kind: str
+):
+    rows = [
+        _access_row(seq=1, event_idx=0, request_seq=0, group_idx=0, hashes=[10]),
+        {"kind": kind},
+    ]
+
+    with pytest.raises(RequestAccessTraceError, match="forbidden"):
+        load_request_access_trace(_write_jsonl(tmp_path / "trace.jsonl", rows))
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "message"),
+    [
+        ("schema_version", 2, "unsupported request-access schema"),
+        ("pass_index", 1, "unsupported request-access pass"),
+        ("lookup_performed", 1, "lookup_performed must be bool"),
+        ("request_id", "private-id", "privacy-sensitive"),
+        ("token_ids", [1, 2, 3], "privacy-sensitive"),
+    ],
+)
+def test_request_access_trace_rejects_schema_pass_and_private_fields(
+    tmp_path: Path, field_name: str, value: object, message: str
+):
+    row = _access_row(seq=1, event_idx=0, request_seq=0, group_idx=0, hashes=[10])
+    row[field_name] = value
+
+    with pytest.raises(RequestAccessTraceError, match=message):
+        load_request_access_trace(_write_jsonl(tmp_path / "trace.jsonl", [row]))
+
+
+def test_request_access_trace_rejects_duplicate_publisher_position(tmp_path: Path):
+    rows = [
+        _access_row(seq=1, event_idx=0, request_seq=0, group_idx=0, hashes=[10]),
+        _access_row(seq=1, event_idx=0, request_seq=0, group_idx=1, hashes=[20]),
+    ]
+
+    with pytest.raises(RequestAccessTraceError, match="duplicate publisher position"):
+        load_request_access_trace(_write_jsonl(tmp_path / "trace.jsonl", rows))

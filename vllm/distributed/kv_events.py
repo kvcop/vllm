@@ -112,12 +112,24 @@ class BlockRemoved(KVCacheEvent):
         )
 
 
+class RequestAccess(KVCacheEvent):
+    """Privacy-safe offload-key access trace for one request and KV group."""
+
+    schema_version: int
+    engine_id: str
+    data_parallel_rank: int
+    request_seq: int
+    pass_index: int
+    group_idx: int
+    terminal_block_hashes: list[ExternalBlockHash]
+
+
 class AllBlocksCleared(KVCacheEvent):
     pass
 
 
 class KVEventBatch(EventBatch):
-    events: list[BlockStored | BlockRemoved | AllBlocksCleared]
+    events: list[BlockStored | BlockRemoved | RequestAccess | AllBlocksCleared]
 
 
 class KVEventAggregator:

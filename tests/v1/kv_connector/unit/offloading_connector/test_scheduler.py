@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call
 
+import msgspec
 import pytest
 import torch
 
@@ -16,7 +17,14 @@ from tests.v1.kv_connector.unit.offloading_connector.utils import (
     to_keys,
 )
 from tests.v1.kv_connector.unit.utils import EOS_TOKEN_ID
-from vllm.distributed.kv_events import MEDIUM_CPU, BlockRemoved, BlockStored
+from vllm.config import KVEventsConfig
+from vllm.distributed.kv_events import (
+    MEDIUM_CPU,
+    BlockRemoved,
+    BlockStored,
+    KVEventBatch,
+    RequestAccess,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
     OffloadingWorkerMetadata,
@@ -110,6 +118,153 @@ def test_recurrent_unhashed_block_does_not_truncate_load_boundary():
     loaded = list(load_job.dst_spec.block_ids)
     assert 41 not in loaded
     assert 42 in loaded
+
+
+def _make_request_access_scheduler(
+    enabled: bool | None, *, kv_events_enabled: bool = True
+):
+    extra_config = {} if enabled is None else {"request_access_events": enabled}
+    vllm_config = _make_vllm_config(extra_config=extra_config)
+    vllm_config.kv_events_config = KVEventsConfig(
+        enable_kv_cache_events=kv_events_enabled,
+        publisher="null",
+    )
+    vllm_config.kv_transfer_config.engine_id = "trace-engine"
+    kv_cache_config = _make_mamba_hybrid_kv_cache_config()
+    spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
+    spec.manager.take_events.return_value = []
+    scheduler = OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
+    return scheduler
+
+
+def _add_request_access_request(
+    scheduler: OffloadingConnectorScheduler,
+    request_id: str,
+    hashes: list[BlockHash],
+):
+    request = MagicMock()
+    request.request_id = request_id
+    request.kv_transfer_params = None
+    request.num_prompt_tokens = len(hashes) * 16
+    request.num_tokens = request.num_prompt_tokens
+    request.block_hashes = hashes
+    request.skip_reading_prefix_cache = False
+    request.is_finished.return_value = False
+    scheduler.on_new_request(request)
+    return request
+
+
+@pytest.mark.parametrize(
+    ("enabled", "kv_events_enabled"),
+    [(None, True), (False, True), (True, False)],
+)
+def test_request_access_events_require_both_opt_ins(
+    enabled: bool | None, kv_events_enabled: bool
+):
+    scheduler = _make_request_access_scheduler(
+        enabled=enabled,
+        kv_events_enabled=kv_events_enabled,
+    )
+    request = _add_request_access_request(
+        scheduler,
+        "private-request-id",
+        [BlockHash(b"hash-0")],
+    )
+
+    scheduler.get_num_new_matched_tokens(request, 0)
+
+    assert list(scheduler.take_events()) == []
+
+
+def test_request_access_events_preserve_groups_order_and_privacy():
+    scheduler = _make_request_access_scheduler(enabled=True)
+    hashes = [BlockHash(f"hash-{i}".encode()) for i in range(3)]
+    request = _add_request_access_request(
+        scheduler,
+        "private-request-id",
+        hashes,
+    )
+
+    scheduler.get_num_new_matched_tokens(request, 0)
+    events = list(scheduler.take_events())
+
+    assert [event.group_idx for event in events] == [0, 1]
+    assert all(isinstance(event, RequestAccess) for event in events)
+    assert all(event.schema_version == 1 for event in events)
+    assert all(event.engine_id == "trace-engine" for event in events)
+    assert all(event.data_parallel_rank == 0 for event in events)
+    assert all(event.request_seq == 0 for event in events)
+    assert all(event.pass_index == 0 for event in events)
+    assert all(event.terminal_block_hashes == hashes for event in events)
+
+    batch = KVEventBatch(ts=1.0, events=events)
+    encoded = msgspec.msgpack.encode(batch)
+    decoded = msgspec.msgpack.decode(encoded, type=KVEventBatch)
+    assert decoded == batch
+
+    payload = msgspec.msgpack.decode(msgspec.msgpack.encode(events[0]))
+    assert set(payload) == {
+        "type",
+        "schema_version",
+        "engine_id",
+        "data_parallel_rank",
+        "request_seq",
+        "pass_index",
+        "group_idx",
+        "terminal_block_hashes",
+    }
+    assert payload["type"] == "RequestAccess"
+    assert b"private-request-id" not in encoded
+
+
+def test_request_access_event_is_complete_once_and_sequence_survives_reset():
+    scheduler = _make_request_access_scheduler(enabled=True)
+    first = _add_request_access_request(
+        scheduler,
+        "first",
+        [BlockHash(b"a"), BlockHash(b"b")],
+    )
+
+    scheduler.get_num_new_matched_tokens(first, 0)
+    scheduler.get_num_new_matched_tokens(first, 0)
+    first_events = list(scheduler.take_events())
+    assert [(event.request_seq, event.group_idx) for event in first_events] == [
+        (0, 0),
+        (0, 1),
+    ]
+
+    scheduler.reset_cache()
+    scheduler.get_num_new_matched_tokens(first, 0)
+    assert list(scheduler.take_events()) == []
+
+    second = _add_request_access_request(
+        scheduler,
+        "second",
+        [BlockHash(b"c")],
+    )
+    _add_request_access_request(
+        scheduler,
+        "never-accessed",
+        [BlockHash(b"ignored")],
+    )
+    scheduler.get_num_new_matched_tokens(second, 0)
+    second_events = list(scheduler.take_events())
+    assert [(event.request_seq, event.group_idx) for event in second_events] == [
+        (1, 0),
+        (1, 1),
+    ]
+
+    third = _add_request_access_request(
+        scheduler,
+        "third",
+        [BlockHash(b"d")],
+    )
+    scheduler.get_num_new_matched_tokens(third, 0)
+    third_events = list(scheduler.take_events())
+    assert [(event.request_seq, event.group_idx) for event in third_events] == [
+        (2, 0),
+        (2, 1),
+    ]
 
 
 def test_scheduler_reports_allocation_failure(request_runner):

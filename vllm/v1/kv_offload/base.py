@@ -215,6 +215,9 @@ class OffloadingKVEventsConfig:
     # OffloadingConnector opt-in for self-describing BlockStored payloads.
     # Effective only when enable_kv_cache_events is true.
     self_describing_kv_events: bool
+    # OffloadingConnector opt-in for privacy-safe request access events.
+    # Effective only when enable_kv_cache_events is true.
+    request_access_events: bool = False
 
 
 class OffloadingManager(ABC):
@@ -587,6 +590,9 @@ class OffloadingSpec(ABC):
             enable_kv_cache_events=config.enable_kv_cache_events,
             self_describing_kv_events=bool(
                 self.extra_config.get("self_describing_kv_events", False)
+            ),
+            request_access_events=bool(
+                self.extra_config.get("request_access_events", False)
             ),
         )
 

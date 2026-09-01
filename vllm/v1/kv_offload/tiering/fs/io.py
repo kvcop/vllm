@@ -95,7 +95,7 @@ def _store_block(
     use_o_direct: bool = True,
 ) -> bool:
     """
-    Store callback: Writes to a temp file then atomically replaces the destination.
+    Store callback: write to a temp file, then publish without overwriting.
     """
     # Check if block already exists to avoid redundant writes
     if os.path.exists(dest_path):
@@ -123,7 +123,12 @@ def _store_block(
                 )
         finally:
             os.close(fd)
-        os.replace(tmp_path, dest_path)
+        try:
+            os.link(tmp_path, dest_path)
+        except FileExistsError:
+            os.remove(tmp_path)
+            return False
+        os.remove(tmp_path)
         return True
     except Exception:
         try:
@@ -176,7 +181,7 @@ def batch_store_block(
     Store a batch of KV blocks from a shared buffer to disk in one call.
 
     Each block buffer[offsets[i] : offsets[i]+block_size] is written atomically
-    to dest_paths[i] via a temp-file rename.  Raises on first error.
+    to dest_paths[i] via an atomic no-overwrite publish. Raises on first error.
     """
     _validate_offsets(view, offsets, block_size)
 

@@ -11,6 +11,14 @@
 #include <string>
 #include <vector>
 
+#ifndef VLLM_FS_IO_BUILD_COMMIT
+#define VLLM_FS_IO_BUILD_COMMIT "unknown"
+#endif
+
+#ifndef VLLM_FS_IO_SOURCE_SHA256
+#define VLLM_FS_IO_SOURCE_SHA256 "unknown"
+#endif
+
 #if defined(O_DIRECT)
 constexpr int kODirectFlag = O_DIRECT;
 #else
@@ -70,12 +78,21 @@ inline int _store_block(const char* tmp_path, const char* dest_path,
     return err;
   }
 
-  if (rename(tmp_path, dest_path) != 0) {
+  // link() is the atomic publish point: unlike rename(), it never replaces an
+  // existing destination. Concurrent writers therefore agree on exactly one
+  // winner, and only that writer contributes store bytes/ops.
+  if (link(tmp_path, dest_path) != 0) {
     const int err = errno;
     unlink(tmp_path);
+    if (err == EEXIST) {
+      return 0;
+    }
     return err;
   }
 
+  // The destination now owns the inode. Removing the private temp name cannot
+  // invalidate the published block, so cleanup is best-effort.
+  unlink(tmp_path);
   *stored = true;
   return 0;
 }
@@ -352,6 +369,19 @@ static struct PyModuleDef fs_io_C_module = {
     fs_io_C_methods,
 };
 
-PyMODINIT_FUNC PyInit_fs_io_C(void) { return PyModule_Create(&fs_io_C_module); }
+PyMODINIT_FUNC PyInit_fs_io_C(void) {
+  PyObject* module = PyModule_Create(&fs_io_C_module);
+  if (module == nullptr) {
+    return nullptr;
+  }
+  if (PyModule_AddStringConstant(module, "__build_commit__",
+                                 VLLM_FS_IO_BUILD_COMMIT) != 0 ||
+      PyModule_AddStringConstant(module, "__source_sha256__",
+                                 VLLM_FS_IO_SOURCE_SHA256) != 0) {
+    Py_DECREF(module);
+    return nullptr;
+  }
+  return module;
+}
 
 }  // extern "C"

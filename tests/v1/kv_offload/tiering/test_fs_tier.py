@@ -13,6 +13,7 @@ import mmap
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -44,6 +45,8 @@ from vllm.v1.kv_offload.tiering.fs.manager import (
     FileSystemTierMetrics,
 )
 from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
+
+pytestmark = pytest.mark.skip_global_cleanup
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -344,6 +347,87 @@ def test_fs_metrics_count_new_files_and_successful_reads(fs_tier):
         FileSystemTierMetrics.LOAD_BYTES: 2 * tier._block_size,
         FileSystemTierMetrics.LOAD_OPS: 2,
     }
+
+
+def test_concurrent_duplicate_store_counts_exactly_one_publish(fs_tier, monkeypatch):
+    """Two writers past the existence hint still have one publish winner."""
+    import vllm.v1.kv_offload.tiering.fs.io as io_mod
+
+    monkeypatch.setattr(io_mod, "_HAS_FSIO_C", False)
+    tier, tensor = fs_tier
+    tensor[0].fill_(1.0)
+    tensor[1].fill_(2.0)
+    duplicate_key = key(42)
+    dest_path = tier.file_mapper.get_file_name(duplicate_key)
+    real_exists = os.path.exists
+    barrier = threading.Barrier(2)
+    call_lock = threading.Lock()
+    matching_calls = 0
+
+    def synchronized_exists(path):
+        nonlocal matching_calls
+        if os.fspath(path) != dest_path:
+            return real_exists(path)
+        with call_lock:
+            matching_calls += 1
+            call_number = matching_calls
+        if call_number <= 2:
+            barrier.wait(timeout=5.0)
+            return False
+        return real_exists(path)
+
+    monkeypatch.setattr(io_mod.os.path, "exists", synchronized_exists)
+    tier.submit_store(make_job(1, [duplicate_key], [0]))
+    tier.submit_store(make_job(2, [duplicate_key], [1]))
+
+    assert all(result.success for result in drain(tier))
+    assert matching_calls == 2
+    stats = tier.get_stats()
+    assert stats is not None
+    assert stats.reduce() == {
+        FileSystemTierMetrics.STORE_BYTES: tier._block_size,
+        FileSystemTierMetrics.STORE_OPS: 1,
+    }
+    assert os.path.isfile(dest_path)
+    with open(dest_path, "rb") as stored_file:
+        stored = stored_file.read()
+    expected = {
+        tensor[0].numpy().tobytes(),
+        tensor[1].numpy().tobytes(),
+    }
+    assert stored in expected
+
+
+def test_c_extension_concurrent_duplicate_store_has_one_winner(tmp_path):
+    """The compiled publisher reports exactly one winner for one destination."""
+    try:
+        from vllm import fs_io_C
+    except ImportError:
+        pytest.skip("fs_io_C extension not built")
+
+    block_size = 2 * 1024 * 1024
+    destination = str(tmp_path / "shared.block")
+    temp_paths = [str(tmp_path / f"writer-{index}.tmp") for index in range(2)]
+    payloads = [bytes([index + 1]) * block_size for index in range(2)]
+    barrier = threading.Barrier(2)
+
+    def store(index: int) -> int:
+        barrier.wait(timeout=5.0)
+        return fs_io_C.batch_store_block(
+            [temp_paths[index]],
+            [destination],
+            [memoryview(payloads[index])],
+            False,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(store, range(2)))
+
+    assert sorted(results) == [0, 1]
+    assert os.path.isfile(destination)
+    with open(destination, "rb") as stored_file:
+        assert stored_file.read() in payloads
+    assert not any(os.path.exists(path) for path in temp_paths)
 
 
 def test_fs_tier_rejects_pipeline_parallelism(tmp_path):

@@ -160,6 +160,23 @@ endif()
 # GIL-releasing filesystem helpers for FileSystemTierManager.
 #
 if(Python_VERSION VERSION_GREATER_EQUAL "3.11")
+  find_package(Git QUIET)
+  if(Git_FOUND)
+    execute_process(
+      COMMAND ${GIT_EXECUTABLE} rev-parse HEAD
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+      OUTPUT_VARIABLE VLLM_FS_IO_BUILD_COMMIT
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      RESULT_VARIABLE VLLM_FS_IO_GIT_RESULT)
+  endif()
+  string(LENGTH "${VLLM_FS_IO_BUILD_COMMIT}" VLLM_FS_IO_COMMIT_LENGTH)
+  if(NOT VLLM_FS_IO_GIT_RESULT EQUAL 0 OR
+     NOT VLLM_FS_IO_COMMIT_LENGTH EQUAL 40 OR
+     NOT VLLM_FS_IO_BUILD_COMMIT MATCHES "^[0-9a-f]+$")
+    set(VLLM_FS_IO_BUILD_COMMIT "unknown")
+  endif()
+  file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/csrc/fs_io.cpp"
+    VLLM_FS_IO_SOURCE_SHA256)
   define_extension_target(
     fs_io_C
     DESTINATION vllm
@@ -167,6 +184,9 @@ if(Python_VERSION VERSION_GREATER_EQUAL "3.11")
     SOURCES csrc/fs_io.cpp
     USE_SABI 3.11
     WITH_SOABI)
+  target_compile_definitions(fs_io_C PRIVATE
+    VLLM_FS_IO_BUILD_COMMIT="${VLLM_FS_IO_BUILD_COMMIT}"
+    VLLM_FS_IO_SOURCE_SHA256="${VLLM_FS_IO_SOURCE_SHA256}")
 endif()
 
 #

@@ -24,6 +24,7 @@ QuantizationMethods = Literal[
     "gptq_marlin",
     "awq_marlin",
     "humming",
+    "exl3",
     "compressed-tensors",
     "bitsandbytes",
     "experts_int8",
@@ -121,6 +122,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from .compressed_tensors.compressed_tensors import (
         CompressedTensorsConfig,
     )
+    from .exl3 import Exl3Config
     from .experts_int8 import ExpertsInt8Config
     from .fbgemm_fp8 import FBGEMMFp8Config
     from .fp8 import Fp8Config
@@ -163,6 +165,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "gpt_oss_mxfp4": GptOssMxfp4Config,
         "deepseek_v4_fp8": DeepseekV4FP8Config,
         "humming": HummingConfig,
+        "exl3": Exl3Config,
         "online": OnlineQuantizationConfig,
         # MiniMax-style checkpoints tag `quant_method: "mxfp8"`; load with the
         # ModelOpt MXFP8 config (same format). The "mxfp8" online shorthand

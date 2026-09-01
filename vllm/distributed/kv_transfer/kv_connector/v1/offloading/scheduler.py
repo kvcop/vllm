@@ -829,7 +829,9 @@ class OffloadingConnectorScheduler:
         )
         self._req_status[request.request_id] = req_status
 
-    def _record_request_access(self, req_status: RequestOffloadState) -> None:
+    def _record_request_access(
+        self, req_status: RequestOffloadState, *, lookup_performed: bool
+    ) -> None:
         if not self._request_access_events_enabled or req_status.request_access_emitted:
             return
 
@@ -845,6 +847,7 @@ class OffloadingConnectorScheduler:
                     data_parallel_rank=self._request_access_dp_rank,
                     request_seq=req_status.request_seq,
                     pass_index=0,
+                    lookup_performed=lookup_performed,
                     group_idx=group_config.group_idx,
                     terminal_block_hashes=[
                         get_offload_block_hash(key) for key in group_state.offload_keys
@@ -886,7 +889,10 @@ class OffloadingConnectorScheduler:
             return None, False
 
         req_status.update_offload_keys()
-        self._record_request_access(req_status)
+        self._record_request_access(
+            req_status,
+            lookup_performed=not request.skip_reading_prefix_cache,
+        )
         req_status.num_locally_computed_tokens = num_computed_tokens
 
         num_hit_tokens: int | None

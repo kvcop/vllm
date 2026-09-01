@@ -45,7 +45,7 @@ as its own commit with its existing focused tests and provenance.
 | ModelOpt mixed FP8-block handling required by the measured checkpoint | `../vllm_benchmark/specs/007-qwen38-model-evaluation/ops/e348-nvfp4-mtp-fp8-candidate/` | Import only with the adjacent W4A8/FP8 routing tests. |
 | Per-request complete prefix-cache exclusion | `../vllm_benchmark/specs/007-qwen38-model-evaluation/ops/e356-echo-no-cache/` | Planned service-isolation feature for short-lived Echo requests; not enabled globally. |
 | Opt-in per-stage pipeline-parallel timing (`VLLM_PP_STAGE_TIMING`) | `../vllm_benchmark/specs/007-qwen38-model-evaluation/DAY_TASKS_2026-08-31.md` item 2; measured PP=2 x TP=2 stage skew of 90-92% against 60-62% GPU busy. | Diagnostic delta, default off and a no-op when unset. It separates per-stage compute from time blocked in the PP recv, which raw GPU-busy percentages cannot distinguish. Retain until the stage skew is explained and closed. |
-| Privacy-safe request-access KV events | `kv_connector_extra_config["request_access_events"]`, together with global KV event publishing. | Diagnostic delta for counterfactual LRU/ARC replay. It emits one ordered opaque-hash vector per request and KV group, with engine/DP/monotonic-sequence identity but no request IDs, token IDs, prompts or media. Disabled by default. |
+| Privacy-safe request-access KV events | `kv_connector_extra_config["request_access_events"]`, together with global KV event publishing. | Diagnostic delta for counterfactual LRU/ARC replay. It emits one ordered opaque-hash vector per request and KV group, with engine/DP/monotonic-sequence identity and a request-wide `lookup_performed` boolean, but no request IDs, token IDs, prompts or media. Disabled by default. |
 | Qwen3.5 native MTP with a pipeline-parallel target | Upstream PRs `#46994`, `#52179` and `#52117`, ported to the `0.27.1` V2 runner with focused model, PP-relay and scheduler tests. | The draft parallel config is a truthful single-stage `PP=1` config while its TP width remains unchanged. The V2 runner owns the complete draft on the last target PP rank. Fixed-width sampled-token broadcast, proposed-draft relay and base-scheduler cadence keep every target stage on the same tokens under synchronous PP execution. Multimodal drafting skips embedding gather on later PP ranks, where no encoder runner exists. |
 | Auxiliary hidden-state relay across pipeline stages | Local fork commit and focused `test_qwen3_next_aux_pp_relay.py` coverage. | EAGLE-3/DFlash/DSpark drafters read hidden states tapped from layers spread over the whole target, but the drafter is built only on the last PP rank. Each stage now taps its own layers and hands them to the next one inside the `IntermediateTensors` relay, keyed by global layer id, so the last stage reassembles the full ascending feature vector. Replaces the V2 runner's blanket refusal of these methods under PP with a per-architecture capability gate. Not yet exercised on hardware: no PP stand run has executed it. |
 
@@ -54,7 +54,9 @@ and `request_access_events` are enabled. It emits one `RequestAccess` event for
 every KV group on the request's first offload lookup pass, including groups with
 an empty hash vector. `request_seq` is gap-free among emitted accesses for one
 `engine_id`; a cache reset does not renumber or duplicate an access, while an
-engine restart changes the identity and starts a new sequence.
+engine restart changes the identity and starts a new sequence. A skip-reading
+request still emits with `lookup_performed=false`: it bypasses maximal-prefix
+lookup and hit accounting but still participates in the policy `touch` path.
 
 The Qwen3.8 chat template is intentionally tracked by the deployment repository
 as an explicit asset. It should be moved into this fork only if the runtime

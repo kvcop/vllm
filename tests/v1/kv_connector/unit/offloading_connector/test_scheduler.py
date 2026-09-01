@@ -195,6 +195,7 @@ def test_request_access_events_preserve_groups_order_and_privacy():
     assert all(event.data_parallel_rank == 0 for event in events)
     assert all(event.request_seq == 0 for event in events)
     assert all(event.pass_index == 0 for event in events)
+    assert all(event.lookup_performed is True for event in events)
     assert all(event.terminal_block_hashes == hashes for event in events)
 
     batch = KVEventBatch(ts=1.0, events=events)
@@ -210,6 +211,7 @@ def test_request_access_events_preserve_groups_order_and_privacy():
         "data_parallel_rank",
         "request_seq",
         "pass_index",
+        "lookup_performed",
         "group_idx",
         "terminal_block_hashes",
     }
@@ -254,6 +256,22 @@ def test_request_access_event_is_complete_once_and_sequence_survives_reset():
         (1, 1),
     ]
 
+    skipped = _add_request_access_request(
+        scheduler,
+        "skip-reading",
+        [BlockHash(b"not-an-access")],
+    )
+    skipped.skip_reading_prefix_cache = True
+    scheduler.manager.lookup.reset_mock()
+    scheduler.get_num_new_matched_tokens(skipped, 0)
+    skipped_events = list(scheduler.take_events())
+    assert [(event.request_seq, event.group_idx) for event in skipped_events] == [
+        (2, 0),
+        (2, 1),
+    ]
+    assert all(event.lookup_performed is False for event in skipped_events)
+    scheduler.manager.lookup.assert_not_called()
+
     third = _add_request_access_request(
         scheduler,
         "third",
@@ -262,9 +280,10 @@ def test_request_access_event_is_complete_once_and_sequence_survives_reset():
     scheduler.get_num_new_matched_tokens(third, 0)
     third_events = list(scheduler.take_events())
     assert [(event.request_seq, event.group_idx) for event in third_events] == [
-        (2, 0),
-        (2, 1),
+        (3, 0),
+        (3, 1),
     ]
+    assert all(event.lookup_performed is True for event in third_events)
 
 
 def test_scheduler_reports_allocation_failure(request_runner):

@@ -1,272 +1,171 @@
-# Stage-safe native CPU KV offload under pipeline parallelism
+# EXL3 weight-quantization backend — day-1 report (track 1)
 
-Branch `pp-stage-safe-offload` on `origin` (github.com/kvcop/vllm), based on
-`qwen38-v0271-fork` @ `53b873b9a0`.
+Branch `exl3-weights-backend` off `qwen38-v0271-fork`. Scope of this day:
+format study, backend skeleton, first passing tests. Verified against the
+real checkpoint `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` (tensors range-fetched
+tensor-by-tensor, no full download) and against upstream
+`turboderp-org/exllamav3` v1.4.5 as the kernel/format source of truth.
 
-- `338719c797` — `[Bugfix][KV Offload] Port unlink-after-rendezvous mmap lifecycle (#52596)`
-- `dead119371` — `[Bugfix][KV Offload] Size the shared CPU tier from per-rank KV layouts under PP`
+## §format — EXL3 tensor layout (verified against the checkpoint)
 
-Worktree: `/home/user/code/work/rnd/llm/vllm-qwen38-v0271-ppstage`.
-CPU code + tests only: no stand access, no systemd, no GPU, no performance
-claims. Unblocks (source-wise) the arm `night-pp2-tp2-mtp-k4-kvfp8-offload56`
-closed fail-closed by benchmark gate commit `66549fd`.
+Every quantized linear `{key}` ships four tensors in the safetensors shards:
 
-## 1. Problem
+| tensor | dtype | shape | meaning |
+|---|---|---|---|
+| `{key}.trellis` | int16 | `(in//16, out//16, 16K)` | packed trellis codes; cell `(i,j)` covers the 16x16 weight block; last dim is a dense K-bit-per-weight bitstream |
+| `{key}.suh` | fp16 | `(in,)` | input-side Hadamard sign **and scale** vector |
+| `{key}.svh` | fp16 | `(out,)` | output-side sign and scale vector |
+| `{key}.mul1` | int32 | scalar | mul1 codebook multiplier used by the encoder |
 
-Under PP2 x TP2 the Qwen3.8 hybrid projection gives per-stage KV group
-signatures `(8,8,8,8)` (stage 0) and `(8,8,8,9)` (stage 1, one extra native-MTP
-full-attention layer). Each worker derives its mmap row width from its LOCAL
-projected tensors, but all four workers rendezvous on one pathname
-`/dev/shm/vllm_offload_{engine_id}.mmap`. With unequal stage views:
+`K = trellis.shape[-1] // 16 = bits_per_weight` per layer. In this checkpoint
+all body linears are K=4, `lm_head` is K=6; the manifest
+(`quantization_config.json`, key `tensor_storage`) records per-module shapes,
+`bits_per_weight` and `mul1_multiplier` — vLLM pre-allocation needs it to
+know K before tensors arrive.
 
-- whichever worker wins `O_EXCL` truncates the file to ITS stage's total; a
-  peer with a larger layout times out in `_wait_for_file_size`, a peer with a
-  smaller layout maps a prefix and interprets rows with the wrong stride —
-  cross-stage aliasing of block storage;
-- `_wait_for_file_size` accepts any size `>=` expected, so a stale larger file
-  is attached silently;
-- the scheduler-side `CPUOffloadingManager` is sized from stage 0's view
-  (`world_size * S0` row) and can allocate block IDs beyond another stage's
-  mapped rows.
+Facts that differ from the day's recon brief:
 
-## 2. Design (implemented)
+- **lm_head IS quantized** (K=6) in this checkpoint; only `embed_tokens` is
+  plain bf16. Vision tower weights are present as plain bf16 too (the config
+  is multimodal; recon called it text-only).
+- `suh`/`svh` are **not** ±1 sign vectors: they carry arbitrary fp16 values
+  (measured: suh ~±0.03, svh ~±1.6). The ±1 form is only what the *packed*
+  `su`/`sv` bitfield variant produces (absent here).
+- The stored `mul1` equals `0x83DCD12D`, the constant hardcoded in the
+  upstream kernels (upstream ignores the stored value; a future checkpoint
+  with a different multiplier would decode wrongly — our loader refuses it).
+- `su`/`sv` packed forms and `mcg` exist in the format but are absent in
+  this checkpoint; `mcg` is unimplemented here.
 
-**One shared mmap + registered per-rank slot-width table ("per-stage size
-accounting").**
+Codebook decode is procedural (`ext/quant/codebook.cuh`, `3INST`): main
+table `x = idx*89226354 + 64248484` then a LOP3 that materializes two fp16s
+whose sum is the codeword. Trellis unpacking (`ext/quant/exl3_dq.cuh`): each
+weight reads a 16-bit window ending at its K-bit boundary out of the
+circular per-tile bitstream — 256 weights per 16x16 tile, `256*K` bits.
 
-1. **Engine core registers the per-worker footprints.**
-   `compute_per_worker_kv_bytes_per_block()` (`vllm/v1/core/kv_cache_utils.py:1855`)
-   runs at the tail of `get_kv_cache_configs()` — after the num_blocks
-   equalization, which preserves the per-block ratio — and stores
-   `per_worker_kv_bytes_per_block` (rank order) on every worker's
-   `KVCacheConfig` (`vllm/v1/kv_cache_interface.py:997`). `None` when single
-   worker or homogeneous (TP-only keeps its previous config shape).
-   `generate_scheduler_kv_cache_config()` deep-copies worker 0's config, so
-   the scheduler carries the same table with zero new IPC. This is the only
-   place in the engine where all workers' post-projection geometry exists.
-
-2. **Connector validates and forwards it.**
-   `_resolve_registered_worker_kv_bytes()` (`offloading/config.py:31`) fails
-   closed when PP>1 has no registered layout, when the entry count differs
-   from `world_size`, when `TP*PP != world_size`, or when TP peers inside one
-   stage disagree. The tuple lands on
-   `OffloadingParallelConfig.worker_kv_bytes_per_block_by_rank`
-   (`vllm/v1/kv_offload/config.py:59`).
-
-3. **CPU spec sizes one layout from the table, not from the local view.**
-   `CPUOffloadingSpec._resolve_slot_chunk_widths()` (`cpu/spec.py:150`):
-   row = `round_up(sum(per-rank chunk widths), PAGESIZE)`;
-   `num_blocks = cpu_bytes // row` — identical on the scheduler and every
-   worker (verified by test), so the manager can never allocate an ID that
-   overflows another stage. Each process also verifies its LOCAL
-   `worker_kv_bytes_per_block` equals its own table slot — refusal, not
-   best-effort attach. Legacy arithmetic is bit-identical when the table is
-   uniform or absent (PP=1): `sum([S*bpc]*W) == S*W*bpc`.
-
-4. **Region places per-rank slots at prefix-sum offsets.**
-   `SharedOffloadRegion(..., slot_page_sizes=...)` (`cpu/shared_offload_region.py:75-104`):
-   slot for rank r spans `[sum(w[0..r)), +w[r])` inside each row; stride is the
-   padded sum. Stage 0 ranks and stage 1 ranks get disjoint byte ranges — a
-   block key resolves to its own stage's slot only. `create_next_view` cursor
-   bounds now use the table. Uniform inputs keep the legacy two-value form
-   exactly (`kv_bytes_per_block`, `cpu_page_size`).
-
-5. **Fail closed on attach.**
-   - Opener requires the file size to be EXACTLY its computed total
-     (`shared_offload_region.py:120-131`): a stale or foreign-sized file is
-     refused with both sizes in the message. (Peer with a LARGER registered
-     table still hits the pre-existing `_wait_for_file_size` timeout — the
-     second documented failure mode, now covered by a test.)
-   - `create_worker` re-checks the device-derived slot against the table
-     (`cpu/spec.py:225-243`): config-rank and device-rank must agree with the
-     local footprint.
-   - Region refuses a rank outside the table (`shared_offload_region.py:97`).
-
-6. **#52596 lifecycle preserved and generalized.**
-   The unlink-after-rendezvous port (commit `338719c797`) keeps the exact
-   marker strings the E358 preflight greps for: `barrier:
-   Callable[[], None] | None = None` and `Unlinked mmap file %s` in the
-   region; `def _all_workers_barrier() -> None:` and
-   `barrier=_all_workers_barrier` in the spec. The barrier runs after every
-   mapping is established, creator unlinks afterwards, mappings stay usable;
-   barrier failure closes fd/mapping and only the creator unlinks. The port
-   was previously venv-only (e339 patch did not apply cleanly to this tree —
-   the venv copy had drifted); it is now a reviewable commit.
-
-### Alternative rejected: per-stage mmap regions
-
-Per-stage files (`vllm_offload_{engine}_s{pp}.mmap`) would also give disjoint
-storage and per-stage lifecycles, and the uniform assumption holds inside one
-stage. Rejected because (a) the scheduler would still need the cross-stage
-geometry for the shared block-ID capacity (`min_s N_s`), so the
-engine-core registration is unavoidable either way; (b) the E358 post-start
-gate's evidence shape — exactly ONE created mmap ~60.1 GB, three opens of the
-same path, one unlink — survives unchanged, so the benchmark preflight needs
-hash updates plus a pre-check swap, not a structural rewrite; (c) one region
-keeps `pin_mmap_region` and the tiering memoryview contract untouched.
-
-## 3. Assumption sites (uniform group view), before -> after
-
-All "before" line numbers are `qwen38-v0271-fork` @ `53b873b9a0`.
-
-| # | Site (before) | Assumption | Fix (after) |
-| --- | --- | --- | --- |
-| A1 | `vllm/v1/kv_offload/cpu/spec.py:91-110` | `kv_bytes_per_block = worker_kv_bytes_per_block * world_size` — local (stage-0) bytes treated as world-uniform; `num_blocks` from that single-view row | `cpu/spec.py:100-146,150-190` — row/`num_blocks` from the registered table; local view only used for verification |
-| A2 | `vllm/v1/kv_offload/cpu/spec.py:149-167` | one slot per rank, uniform `cpu_page_size`, `rank = device_index % world_size` | `cpu/spec.py:213-256` — same slot identity, table-checked; table only passed when genuinely unequal |
-| A3 | `vllm/v1/kv_offload/cpu/shared_offload_region.py:53-63` | `total_size` from local view; offsets `rank * cpu_page_size` | `shared_offload_region.py:75-104` — prefix-sum slot table, padded-sum stride |
-| A4 | `vllm/v1/kv_offload/cpu/shared_offload_region.py:15-25` | `_wait_for_file_size` accepts `>=` (silent attach to wrong-size file) | `shared_offload_region.py:117-131` — exact-size requirement, refusal names both sizes |
-| A5 | `vllm/distributed/kv_transfer/kv_connector/v1/offloading/config.py:98-111` | `worker_kv_bytes_per_block = total_gpu_kv_bytes // num_blocks` from the local projection (gate-pinned marker) | unchanged derivation; consumed via `_resolve_registered_worker_kv_bytes` (`config.py:31-84`) |
-| A6 | `vllm/v1/core/kv_cache_utils.py:1855-1874` + `vllm/v1/engine/core.py:315` | scheduler config = deepcopy of worker 0 ("arbitrary"), so scheduler-side capacity uses stage 0's view | registration now rides the same deepcopy: attach at `kv_cache_utils.py:2271-2275`, field at `kv_cache_interface.py:993-997` |
-
-Out of scope (unchanged, documented upstream of this work): the tiering FS
-tier consumes `layer_names` through `FileMapper` and hashes a per-stage base
-path under PP (LIVE_PLAN `E358-NIGHT-...` tiering note); native offload does
-not use that path.
-
-## 4. Gate `66549fd` evidence requirements
-
-| Gate requirement (from the commit + handoff §2a) | Status on this branch |
-| --- | --- |
-| Scheduler `#52807` hash `5ce2518d…` | unchanged (`5ce2518dc021e89a61b478d650d5f5b2d6dae5f2aa031bfe8b5b33a5b255eecd`) — the port was already in the fork tree |
-| Region + spec carry the `#52596` lifecycle markers | verified verbatim (4/4 markers, see §2.6); the lifecycle is now a fork commit, not a venv overlay |
-| Equal stage group signatures before sharing one mmap | superseded constructively: unequal signatures are now SAFE because every worker derives stride/offsets from one registered table; the equal-signature check should be REPLACED in the preflight by "registered layout present + validated" (see §7 checklist item P3) |
-| Exact source hashes for the offload contract | new values in §6 — preflight must be updated before any arm boots this runtime |
-| Stale-mmap and `64,000,000,000`-byte SHM prechecks | unchanged semantics; the runtime additionally self-defends (exact-size refusal) against a stale file that slips past the precheck |
-| Post-start: one ~60.1 GB mmap, three opens of the same path, one unlink after rendezvous | layout preserves the single-region shape: total = `num_blocks * round_up(sum(widths))` still consumes the same `cpu_bytes_to_use` (56 GiB -> ~60.1 GB decimal row total unchanged: row = padded true full-model row instead of the naive stage-0 row, `num_blocks` adjusted accordingly); the existing `gate_native_offload_region` regexes still match `Created/Opened/Unlinked mmap file` |
-| "Do not clear the offload arguments" (no silent no-offload fallback) | respected: PP>1 without a registered layout raises — no fallback path was added anywhere |
-
-## 5. Test evidence
-
-CPU env: night-executor venv (py3.12.3, torch 2.13.0+cu130 as CPU) +
-`PYTHONPATH=<worktree>`; local shim `cpu_noop_cleanup_plugin.py` (untracked,
-copied from `/tmp/day31-verify`) no-ops the CUDA cleanup fixture.
+Reconstruction (matches `LinearEXL3.get_weight_tensor` to 5e-4 max rel):
 
 ```
-PYTHONPATH=$PWD pytest tests/v1/kv_offload/ -q -p no:cacheprovider -p cpu_noop_cleanup_plugin
-  base 53b873b9a0: 503 passed, 1 skipped
-  this branch:      523 passed, 1 skipped   (+3 factory, +17 new file)
-
-PYTHONPATH=$PWD pytest tests/v1/core/ -q … --ignore={test_async_scheduler,test_kv_sharing,test_deferred_block_free}.py --continue-on-collection-errors
-  this branch:     49 failed, 899 passed, 3 errors
-  clean day31-verify tree, same env: 49 failed, 376 passed(shard), 3 errors
-  -> diff of FAILED lists: IDENTICAL_FAILURE_SETS (env: LLaVA model
-     inspection, vllm_flash_attn CUDA import, kernel_warmup import; not the diff)
-
-ruff format --check + ruff check on all touched files: clean
-mypy on the 5 touched source files: Success, no issues
+core = ext.reconstruct(trellis, K, mcg=False, mul1=True)   # (in, out) fp16
+W    = blkhad_128(core, dim=in)  * suh[:, None]            # H_128 Sylvester / sqrt(128)
+W    = blkhad_128(W,     dim=out) * svh[None, :]
 ```
 
-New coverage in `tests/v1/kv_offload/cpu/test_pp_stage_safe_offload.py`
-(+ `tests/v1/kv_offload/test_factory.py` additions):
+End-to-end check against the **original bf16 weights**
+(`Qwen/Qwen3.8-27B`, layer 3 `q_proj`): rel L2 7.05 %, cos 0.9975 — the
+decode recovers the true weights, not just self-consistent output.
 
-- heterogeneous round-trip per stage: 4 ranks, widths (2P,2P,2.5P+64,…), each
-  rank writes/reads its slot; raw-mmap assertion that no byte lands outside a
-  rank's own slot and row-tail padding stays zero;
-- sizing: all ranks + scheduler resolve identical `num_blocks`/stride from the
-  table; uniform table reproduces legacy layout byte-for-byte (legacy form vs
-  table form, same offsets/stride/total);
-- refusal: PP without registered table; local-view drift vs own slot (config
-  rank AND device rank); rank outside table; stale/foreign-sized file (both
-  directions: smaller table -> exact-size RuntimeError; larger table ->
-  `_wait_for_file_size` TimeoutError);
-- lifecycle: barrier rendezvous unlinks the path while mappings stay shared;
-  barrier failure closes mapping and only the creator unlinks;
-- engine-core attach: homogeneous -> None (TP shape preserved), PP-shaped ->
-  table on every config, scheduler deepcopy carries it.
+Checkpoint→vLLM name mapping (qwen3_5): the fork already fuses
+`in_proj_qkv|in_proj_z → in_proj_qkvz` (shards (0,1,2)/(3)), `q|k|v →
+qkv_proj`, `gate|up → gate_up_proj` via `WeightsMapper` + packed modules —
+all suffix-agnostic, so `.trellis/.suh/.svh/.mul1` route through unchanged.
 
-## 6. New SHA-256 for the benchmark preflight (E358)
+## §design
 
-Update `PATCHED_OFFLOAD_SHA256_BY_PATH` / `AUDITED_PP_OFFLOAD_SHA256_BY_PATH`
-in `scripts/stand/qwen38_e358_tp4_pilot_preflight.py` from this branch:
+Chosen: a native vLLM `QuantizationConfig` ("exl3",
+`vllm/model_executor/layers/quantization/exl3.py`) that
 
-| path | old (pinned) | new (this branch) |
-| --- | --- | --- |
-| `distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py` | `5ce2518d…` | `5ce2518dc021e89a61b478d650d5f5b2d6dae5f2aa031bfe8b5b33a5b255eecd` (unchanged) |
-| `v1/kv_offload/cpu/shared_offload_region.py` | `855635a0…` | `e8f9276bbb9a0b09682b37a5b273acca2e3381938827ce8cfc10f8a35cf925c7` |
-| `v1/kv_offload/cpu/spec.py` | `f590d2f1…` | `9a5e2117f2fcaaa053922a325377756177b0455ff4acfb4872f5875b91667add` |
-| `distributed/kv_transfer/kv_connector/v1/offloading/config.py` | `49a6aa9c…` | `9ed92e889559f76a60e6c8d1e3b6e8a1443ece842bf860fe5af482c62b8f56f7` |
-| `v1/core/kv_cache_utils.py` | `0ab53859…` | `bd4f6f4e9d4f4db12ee99954a816568f287c151fa7c14f9b554ab6a0db9c9352` |
-| `model_executor/models/qwen3_5.py` | `29a9e4c1…` | `d63f913d60196c422e711d70d81d067e4a6ac015a46e6ea316607c4d44835f64` (changed by fork `13b123c7c7`, NOT by this branch) |
+- resolves each vLLM layer prefix to its manifest parts (handles fused
+  leaves `qkv_proj`/`gate_up_proj`/`in_proj_qkvz` and the
+  `model.` vs `model.language_model.` prefix difference),
+- creates params `trellis` (int16 3D), `suh` (fp16 `(in, pieces)` — see the
+  fused-suh finding below), `svh` (fp16 `(out,)`), `mul1` (int32 scalar),
+- installs its own `layer.weight_loader` (humming-style interception)
+  computing stacked-shard + TP offsets itself; trellis offsets divide by 16,
+- dequantizes via the upstream kernels: `BC_LinearEXL3` fused kernels for
+  decode-sized batches (rows ≤ 144, env `VLLM_EXL3_DECODE_ROWS`), and
+  slab-streamed `reconstruct_slice` + torch GEMM for prefill
+  (`VLLM_EXL3_PREFILL_SLAB`, default 32768 columns), so no bf16 copy of a
+  layer is ever materialized (27B at 3.5 bpw stays ~14 GB).
 
-New preflight marker suggestions (replace the equal-signature check): the
-four `#52596` markers (already grepped today, still verbatim), plus
-`per_worker_kv_bytes_per_block` present in `kv_cache_interface.py`,
-`compute_per_worker_kv_bytes_per_block` in `kv_cache_utils.py`, and
-`slot_page_sizes` in `shared_offload_region.py`.
+Alternatives considered: materialize bf16 at load (rejected: doubles memory,
+defeats the 24 GB goal); fork their kernels into vLLM C++ (deferred: today
+the python package import is the cheapest correct seam); per-part vLLM
+linears instead of fusing (their architecture does this; deferred — would
+touch `qwen3_5.py`/GDN modules).
 
-## 7. GPU verification boot checklist (feeds the fail-closed preflight)
+**Fused-layer finding (main design discovery of the day):** parts of a fused
+vLLM linear carry **independently optimized, different `suh` vectors**
+(measured qkv vs z: ~5 % apart). One shared `suh` — the assumption in
+exllamav3's own fused forward — would skew outputs by that amount. The
+backend therefore stores `suh` as `(in, pieces)` and dequantizes each fused
+piece with its own column. The BC kernels accept a single `suh`, so the
+fused decode path is disabled: fused layers run slab-dequant at every batch
+size. Single-piece layers (o_proj, down_proj, out_proj) get the fast BC
+path.
 
-Environment gates before start (unchanged): queue drained, confirmed
-`sudo qwen-stand stop` boundary, no stale `/dev/shm/vllm_offload_*.mmap`,
-`>= 64,000,000,000` bytes free in `/dev/shm`, preflight hashes from §6.
+## §works
 
-- **P1 boot**: `night-pp2-tp2-mtp-k4-kvfp8-offload56` reaches
-  `Application startup complete` on PP2 x TP2; all four workers attach without
-  the exact-size refusal or a `_wait_for_file_size` timeout.
-- **P2 journal**: exactly one `Created mmap file … (≈60.x GB)` (row total
-  stays `cpu_bytes_to_use`-driven), three `Opened existing mmap file`, one
-  `Unlinked mmap file` AFTER the last open (rendezvous order), zero
-  `Removed mmap file` before rendezvous.
-- **P3 preflight swap**: equal-signature requirement replaced by
-  registered-layout validation (hashes §6 + markers); `_pp_stage_group_signatures`
-  kept as informational output `(8,8,8,8)/(8,8,8,9)`, no longer a blocker.
-- **P4 negative controls**: (a) restart with a hand-sized stale larger mmap →
-  workers must refuse with the exact-size error, engine fails loudly;
-  (b) mismatched runtime (one file from the old layout) → same refusal.
-- **P5 smokes**: text + tool + substantive image on the exact profile, plus
-  the local-argmax MTP marker — the E358 standard set.
-- **P6 correctness under load**: verify stores/loads actually reconstruct
-  per-stage layers — run a repeated-prefix workload and confirm CPU-tier hits
-  return identical tokens vs the no-offload sibling (byte-identical responses
-  on a frozen copy-shaped probe is the established bar).
-- **P7 metrics**: `/metrics` offload gauges sane (no saturation growth), KV
-  event trace shows CPU store/load per stage, no unexplained preemptions.
-- **P8 recovery**: kill one worker mid-transfer → peers fail loudly (barrier
-  timeout / executor teardown), no partial-garbage serving; restart clean.
-- **P9 rollback**: `pilot-offload` (TP4 profile) still boots byte-compatibly
-  on this runtime — uniform layout must be untouched.
+`tests/quantization/test_exl3.py` — 11 passed (7 CPU, 4 GPU, on the RTX 4090
+Laptop, no perf claims):
 
-## 8. Open risks
+- registry membership, manifest part resolution (plain/fused/passthrough),
+  loud `NotImplementedError` for a quantized lm_head, K-mismatch rejection;
+- loader placement on real checkpoint tensors: plain q_proj byte-exact,
+  fused in_proj_qkvz (4 pieces, spans + single) byte-exact concat,
+  row-parallel down_proj, bad mul1 refused;
+- numerics: backend dequant vs `LinearEXL3.get_weight_tensor` (5e-3);
+  BC decode path and slab prefill path vs materialized-W GEMM (1e-2, fp16
+  order-of-operations); fused gate_up with differing suh vs per-part
+  references (1.5e-2, bf16 GEMM vs fp16 reference).
 
-1. **Not GPU-verified.** All evidence is CPU-unit-level; P1-P9 above are the
-   admission bar. No performance claim is made or implied.
-2. **Barrier deadlock on asymmetric failure**: a worker that fails the new
-   checks before mapping leaves peers blocked in the world-group barrier until
-   the executor tears the engine down (pre-existing property of the #52596
-   design, now more likely to fire on genuine mismatches — by intent: loud
-   failure instead of corruption).
-3. **`torch.accelerator.current_device_index() % world_size` as slot id** is
-   the pre-existing TP4 production assumption; under PP2xTP2 each rank still
-   owns a distinct GPU on the stand. If a future topology breaks the
-   device==global-rank bijection, the create_worker check refuses rather than
-   aliasing — but the refusal would look like a boot failure.
-4. **`num_blocks` shrinks slightly** vs the old (unsafe) formula: the row is
-   now the true padded full-model row; the stage-0 naive row understated it by
-   stage 1's extra MTP layer (roughly 2 of ~130 per-layer shares, ~1.5%, for
-   this geometry — exact figure depends on GDN/full per-layer byte mix).
-   `cpu_bytes_to_use` consumption stays ~56 GiB.
-5. **Group-count/tokens-per-block equality across stages** remains an
-   assumption of the transfer machinery (already enforced at runtime by the
-   worker handler's `group_sizes` assertion); the registration does not
-   re-check it. Fine for the registered arm; a model whose per-stage
-   projection changed GROUP COUNT would fail in the existing assert.
-6. **`qwen3_5.py` hash drift** vs the audited pin predates this branch
-   (fork `13b123c7c7`); preflight owners must decide whether to re-pin from
-   this branch wholesale.
-7. The exact-size opener check compares against `os.fstat` after the wait
-   loop; a creator that legitimately truncates twice (never happens today:
-   single `ftruncate` per creator) would trip it.
+Environment notes: exllamav3 v1.4.5 ext builds on this box only after a
+one-line host shim in `exllamav3_ext/util.cuh` (CUDA 12.0's `cuda_fp16.h`
+declares `__halves2half2` device-only; the libtorch/cpu `.cpp` files include
+it with plain g++). Patch lives in the local clone (`.tmp/exl3/exllamav3`,
+untracked); it is an upstream PR candidate. Also pre-existing on this CPU
+venv: `get_quantization_config()` dies in the quark import chain
+(`vllm.vllm_flash_attn` not compiled) for any method — unrelated to this
+branch.
 
-## 9. Reproduction
+## §blocked / debts
 
-```
-git worktree add <path> -b pp-stage-safe-offload qwen38-v0271-fork  # base
-git fetch origin pp-stage-safe-offload && git checkout pp-stage-safe-offload
-V=<cpu venv with torch+pytest>
-PYTHONPATH=$PWD $V/bin/python -m pytest tests/v1/kv_offload/ -q \
-  -p no:cacheprovider -p cpu_noop_cleanup_plugin
-ruff format --check vllm/v1/kv_offload vllm/v1/core/kv_cache_utils.py
-ruff check vllm/v1/kv_offload vllm/v1/core/kv_cache_utils.py
-mypy vllm/v1/kv_offload/cpu/spec.py vllm/v1/kv_offload/cpu/shared_offload_region.py \
-  vllm/distributed/kv_transfer/kv_connector/v1/offloading/config.py
-```
+1. **lm_head (K=6) refused** → full-engine load of this checkpoint fails at
+   model build with an explicit error. Needs either an EXL3 ParallelLMHead
+   path (trellis decode for a 248k×5120 projection) or a checkpoint variant
+   with bf16 lm_head.
+2. **Fused layers have no BC decode path** (per-part suh) — correctness
+   kept, decode-speed debt. Options: per-part BC objects with contiguous
+   trellis copies, or unfused per-part linears at the model level.
+3. **`tensor_storage` manifest only read via `--quantization exl3`** (sidecar
+   `quantization_config.json`); config.json's embedded quantization_config
+   lacks the manifest, so auto-detection builds a config that then fails per
+   layer. Fix: merge the sidecar json in `_parse_quant_hf_config` (small
+   upstreamable patch).
+4. **TP>1 and PP untested**; multi-part span pieces (e.g. `in_proj_qkv`
+   covering shards 0-2) raise `NotImplementedError` under TP>1 — per-part
+   placement is written for TP1 only. TP slicing math for single pieces is
+   implemented but unverified.
+5. **No kernel-free path**: both forward paths need the compiled
+   `exllamav3.ext`. A pure-torch trellis decoder (sliding 16-bit window +
+   procedural codebook, both now documented) would enable CPU tests and a
+   real dequant-to-bf16 mode.
+6. Engine-level integration (model load through `Qwen3_5` AutoWeightsLoader,
+   GDN `conv1d`/`in_proj_ba` passthrough, mamba state) is not exercised yet.
+
+## §next — concrete steps
+
+1. lm_head: extend `Exl3LinearMethod` with an `embedding()`-style gather over
+   dequantized vocab slabs, or materialize bf16 lm_head at load
+   (`vllm/model_executor/layers/quantization/exl3.py`, `get_quant_method`).
+2. Manifest sidecar merge: `vllm/config/model.py`
+   (`_parse_quant_hf_config`) + `vllm/transformers_utils/config.py`.
+3. First end-to-end layer-level load through the real
+   `Qwen3_5DecoderLayer` (needs 1+2), then a 2-layer mini-model smoke on the
+   laptop GPU.
+4. Fused decode path: per-part BC (measure VRAM cost of contiguous trellis
+   copies) or model-level unfusing in `qwen3_5.py`.
+5. TP2 test on the laptop (both GPUs free? else stand) using the existing
+   slicing math; then PP.
+6. Pure-torch trellis decoder in `exl3.py` (format facts in §format are the
+   spec) → CPU tests, bf16-materialize mode for debugging.
+7. Upstream PRs: `util.cuh` host shim; per-layer `mul1_multiplier` handling
+   (kernels should read the stored value, not assume the constant).
+
+## Repro pointers
+
+- Fixture fetcher: `.tmp/exl3/refetch.py` (HTTP-range tensor extraction;
+  safetensors `data_offsets` are relative to the data section, i.e. absolute
+  offset = `8 + header_len + data_offset` — this cost an hour today).
+- Oracle probe: `.tmp/exl3/` scripts; ext build log `/tmp/exl3_ext_build2.log`.
+- Tests: `EXL3_FIXTURE_DIR=<...> pytest tests/quantization/test_exl3.py`.

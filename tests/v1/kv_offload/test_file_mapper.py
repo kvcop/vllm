@@ -60,6 +60,7 @@ def make_mapper_from_offloading_spec(**kwargs) -> FileMapper:
         offloading_spec=spec,
         blocks_per_file=config.cache.blocks_per_chunk,
         parallel_agnostic=kwargs.get("parallel_agnostic", False),
+        python_hash_seed=kwargs.get("python_hash_seed"),
     )
 
 
@@ -128,6 +129,14 @@ def test_get_config_file_path():
     fm = make_mapper_from_offloading_spec()
     config_path = fm.get_config_file_path()
     assert config_path == f"{fm.base_path}/config.json"
+
+
+def test_python_hash_seed_is_part_of_persistent_identity():
+    seed_zero = make_mapper_from_offloading_spec(python_hash_seed="0")
+    seed_one = make_mapper_from_offloading_spec(python_hash_seed="1")
+
+    assert seed_zero.fields["python_hash_seed"] == "0"
+    assert seed_zero.base_path != seed_one.base_path
 
 
 def test_hybrid_file_identity_uses_resolved_tokens_per_hash():

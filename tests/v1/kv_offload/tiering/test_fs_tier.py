@@ -8,6 +8,7 @@ The tier manager writes KV cache blocks to disk and reads them back, verifying
 data integrity throughout the process.
 """
 
+import json
 import mmap
 import os
 import threading
@@ -22,6 +23,7 @@ from vllm.v1.kv_offload.base import (
     Locality,
     LookupResult,
     Medium,
+    OffloadingCounterMetadata,
     OffloadingEvent,
     OffloadingKVEventsConfig,
     OffloadKey,
@@ -39,6 +41,7 @@ from vllm.v1.kv_offload.tiering.base import JobMetadata
 from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
 from vllm.v1.kv_offload.tiering.fs.manager import (
     FileSystemTierManager,
+    FileSystemTierMetrics,
 )
 from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
 
@@ -58,6 +61,7 @@ def _make_offloading_spec(
     tp_size: int = 1,
     rank: int = 0,
     world_size: int | None = None,
+    pp_size: int = 1,
     replicated_layout: bool = False,
     is_parallelism_agnostic: bool = False,
 ) -> MagicMock:
@@ -77,7 +81,7 @@ def _make_offloading_spec(
             rank=rank,
             world_size=world_size,
             tp_size=tp_size,
-            pp_size=1,
+            pp_size=pp_size,
             pcp_size=1,
             dcp_size=1,
             data_parallel_index=0,
@@ -298,6 +302,151 @@ def test_factory_forwards_locality_to_fs_tier(tmp_path):
         assert tier.locality is Locality.LOCAL
     finally:
         tier.shutdown()
+
+
+def test_fs_metric_definitions_are_separate_counters():
+    definitions = FileSystemTierManager.build_metric_definitions({})
+
+    assert set(definitions) == {
+        FileSystemTierMetrics.LOAD_BYTES,
+        FileSystemTierMetrics.LOAD_OPS,
+        FileSystemTierMetrics.STORE_BYTES,
+        FileSystemTierMetrics.STORE_OPS,
+    }
+    assert all(
+        isinstance(metadata, OffloadingCounterMetadata)
+        for metadata in definitions.values()
+    )
+
+
+def test_fs_metrics_count_new_files_and_successful_reads(fs_tier):
+    tier, _ = fs_tier
+    keys = [key(1), key(2)]
+    tier.submit_store(make_job(1, keys, [0, 1]))
+    assert all(result.success for result in drain(tier))
+
+    store_stats = tier.get_stats()
+    assert store_stats is not None
+    assert store_stats.reduce() == {
+        FileSystemTierMetrics.STORE_BYTES: 2 * tier._block_size,
+        FileSystemTierMetrics.STORE_OPS: 2,
+    }
+
+    tier.submit_store(make_job(2, keys, [0, 1]))
+    assert all(result.success for result in drain(tier))
+    assert tier.get_stats() is None
+
+    tier.submit_load(make_job(3, keys, [2, 3], is_promotion=True))
+    assert all(result.success for result in drain(tier))
+    load_stats = tier.get_stats()
+    assert load_stats is not None
+    assert load_stats.reduce() == {
+        FileSystemTierMetrics.LOAD_BYTES: 2 * tier._block_size,
+        FileSystemTierMetrics.LOAD_OPS: 2,
+    }
+
+
+def test_fs_tier_rejects_pipeline_parallelism(tmp_path):
+    tensor = _page_aligned_zero_tensor(4, _BLOCK_ELEMENTS)
+
+    with pytest.raises(ValueError, match="pipeline_parallel_size must be 1"):
+        FileSystemTierManager(
+            offloading_spec=_make_offloading_spec(tp_size=2, pp_size=2, world_size=4),
+            primary_kv_view=memoryview(tensor.numpy()),
+            tier_type="fs",
+            root_dir=str(tmp_path),
+        )
+
+
+def test_fs_tier_requires_configured_python_hash_seed(tmp_path, monkeypatch):
+    tensor = _page_aligned_zero_tensor(4, _BLOCK_ELEMENTS)
+    monkeypatch.setenv("PYTHONHASHSEED", "1")
+
+    with pytest.raises(ValueError, match="requires PYTHONHASHSEED=0"):
+        FileSystemTierManager(
+            offloading_spec=_MOCK_OFFLOADING_SPEC,
+            primary_kv_view=memoryview(tensor.numpy()),
+            tier_type="fs",
+            root_dir=str(tmp_path),
+            expected_python_hash_seed="0",
+        )
+
+
+def test_fs_tier_requires_private_root_mode(tmp_path):
+    tensor = _page_aligned_zero_tensor(4, _BLOCK_ELEMENTS)
+    tmp_path.chmod(0o755)
+
+    with pytest.raises(PermissionError, match="mode must be 0o700"):
+        FileSystemTierManager(
+            offloading_spec=_MOCK_OFFLOADING_SPEC,
+            primary_kv_view=memoryview(tensor.numpy()),
+            tier_type="fs",
+            root_dir=str(tmp_path),
+            required_root_mode=0o700,
+        )
+
+
+def test_fs_tier_can_require_o_direct(tmp_path, monkeypatch):
+    tensor = _page_aligned_zero_tensor(4, _BLOCK_ELEMENTS)
+    monkeypatch.setattr(
+        "vllm.v1.kv_offload.tiering.fs.manager.probe_o_direct",
+        lambda _directory: False,
+    )
+
+    with pytest.raises(RuntimeError, match="O_DIRECT is required"):
+        FileSystemTierManager(
+            offloading_spec=_MOCK_OFFLOADING_SPEC,
+            primary_kv_view=memoryview(tensor.numpy()),
+            tier_type="fs",
+            root_dir=str(tmp_path),
+            require_o_direct=True,
+        )
+
+
+def test_fs_tier_reuses_seed_bound_files_after_restart(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYTHONHASHSEED", "0")
+    tmp_path.chmod(0o700)
+    root = str(tmp_path)
+    writer_tensor = _page_aligned_rand_tensor(4, _BLOCK_ELEMENTS)
+    expected = writer_tensor[0].clone()
+    writer = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=memoryview(writer_tensor.numpy()),
+        tier_type="fs",
+        root_dir=root,
+        expected_python_hash_seed="0",
+        required_root_mode=0o700,
+    )
+    try:
+        writer.submit_store(make_job(1, [key(7)], [0]))
+        assert all(result.success for result in drain(writer))
+        base_path = writer.file_mapper.base_path
+        block_path = writer.file_mapper.get_file_name(key(7))
+        with open(
+            writer.file_mapper.get_config_file_path(), encoding="utf-8"
+        ) as config_file:
+            assert json.load(config_file)["python_hash_seed"] == "0"
+    finally:
+        writer.shutdown()
+
+    reader_tensor = _page_aligned_zero_tensor(4, _BLOCK_ELEMENTS)
+    reader = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=memoryview(reader_tensor.numpy()),
+        tier_type="fs",
+        root_dir=root,
+        expected_python_hash_seed="0",
+        required_root_mode=0o700,
+    )
+    try:
+        assert reader.file_mapper.base_path == base_path
+        assert reader.file_mapper.get_file_name(key(7)) == block_path
+        assert lookup_and_wait(reader, [key(7)]) == [LookupResult.HIT]
+        reader.submit_load(make_job(2, [key(7)], [1], is_promotion=True))
+        assert all(result.success for result in drain(reader))
+        assert torch.allclose(reader_tensor[1], expected)
+    finally:
+        reader.shutdown()
 
 
 def test_failed_load_missing_file(fs_tier):

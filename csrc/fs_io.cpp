@@ -38,7 +38,9 @@ inline int ensure_parent_dirs(const std::string& path) {
 // before any subsequent cleanup call can overwrite it. On failure, the temp
 // file is removed.
 inline int _store_block(const char* tmp_path, const char* dest_path,
-                        const char* src, size_t size, bool use_o_direct) {
+                        const char* src, size_t size, bool use_o_direct,
+                        bool* stored) {
+  *stored = false;
   if (access(dest_path, F_OK) == 0) {
     return 0;  // Already present.
   }
@@ -74,6 +76,7 @@ inline int _store_block(const char* tmp_path, const char* dest_path,
     return err;
   }
 
+  *stored = true;
   return 0;
 }
 
@@ -228,18 +231,21 @@ static PyObject* batch_store_block(PyObject* /*self*/, PyObject* args) {
 
   Py_ssize_t failed_index = -1;
   int failure_errno = 0;
+  Py_ssize_t blocks_stored = 0;
 
   {
     Py_BEGIN_ALLOW_THREADS for (Py_ssize_t i = 0; i < n; i++) {
       const char* buf = static_cast<const char*>(buffers[i].buf);
-      const int err =
-          _store_block(tmp_paths[i], dest_paths[i], buf,
-                       static_cast<size_t>(buffers[i].len), use_o_direct);
+      bool stored = false;
+      const int err = _store_block(tmp_paths[i], dest_paths[i], buf,
+                                   static_cast<size_t>(buffers[i].len),
+                                   use_o_direct, &stored);
       if (err != 0) {
         failed_index = i;
         failure_errno = err;
         break;
       }
+      blocks_stored += stored ? 1 : 0;
     }
     Py_END_ALLOW_THREADS
   }
@@ -253,7 +259,7 @@ static PyObject* batch_store_block(PyObject* /*self*/, PyObject* args) {
                                           dest_paths[failed_index]);
   }
 
-  Py_RETURN_NONE;
+  return PyLong_FromSsize_t(blocks_stored);
 }
 
 /// @brief Load a batch of blocks from disk, each into its own buffer.
@@ -316,7 +322,7 @@ static PyObject* batch_load_block(PyObject* /*self*/, PyObject* args) {
                                           source_paths[failed_index]);
   }
 
-  Py_RETURN_NONE;
+  return PyLong_FromSsize_t(n);
 }
 
 static PyMethodDef fs_io_C_methods[] = {
@@ -327,17 +333,17 @@ static PyMethodDef fs_io_C_methods[] = {
     {"batch_store_block", batch_store_block, METH_VARARGS,
      "batch_store_block(tmp_paths: list[str], dest_paths: list[str],\n"
      "                  buffers: list[bytes-like],\n"
-     "                  use_o_direct: bool = True) -> None\n"
+     "                  use_o_direct: bool = True) -> int\n"
      "\n"
      "Store a batch of blocks, each from its own buffer, to disk. Raises on "
-     "first error."},
+     "first error. Returns the number of new files written."},
     {"batch_load_block", batch_load_block, METH_VARARGS,
      "batch_load_block(source_paths: list[str],\n"
      "                 buffers: list[writable bytes-like],\n"
-     "                 use_o_direct: bool = True) -> None\n"
+     "                 use_o_direct: bool = True) -> int\n"
      "\n"
      "Load a batch of blocks from disk into corresponding buffers. "
-     "Raises on first error."},
+     "Raises on first error. Returns the number of files read."},
     {nullptr, nullptr, 0, nullptr},
 };
 

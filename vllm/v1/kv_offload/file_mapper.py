@@ -36,6 +36,7 @@ class FileMapper:
         inference_engine: str = "vllm",
         parallel_agnostic: bool = False,
         replicated_layout: bool = False,
+        python_hash_seed: str | None = None,
     ):
         """
         Initialize the file mapper. Each worker constructs its own, but
@@ -65,6 +66,8 @@ class FileMapper:
         # unchanged (False is the historical default and must not appear).
         if replicated_layout:
             self.fields["replicated_layout"] = True
+        if python_hash_seed is not None:
+            self.fields["python_hash_seed"] = python_hash_seed
         self.base_path: str = self._compute_base_path(root_dir, self.fields)
 
     @classmethod
@@ -74,6 +77,7 @@ class FileMapper:
         offloading_spec: OffloadingSpec,
         blocks_per_file: int = 1,
         parallel_agnostic: bool = False,
+        python_hash_seed: str | None = None,
     ) -> "FileMapper":
         """Build a FileMapper from an OffloadingSpec."""
         config = offloading_spec.config
@@ -102,6 +106,7 @@ class FileMapper:
                 and (parallel.is_parallelism_agnostic or config.replicated_layout)
             ),
             replicated_layout=(parallel_agnostic and config.replicated_layout),
+            python_hash_seed=python_hash_seed,
         )
 
     def get_file_name(self, key: OffloadKey) -> str:

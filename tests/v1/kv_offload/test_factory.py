@@ -182,6 +182,23 @@ def test_tiering_spec_aligns_row_size():
     assert spec.num_blocks == 3
 
 
+def test_tiering_store_threshold_rejected_before_allocating_region(monkeypatch):
+    import vllm.v1.kv_offload.tiering.spec as tiering_spec_module
+
+    spec = _create_spec(
+        spec_name="TieringOffloadingSpec",
+        extra_config={"store_threshold": 2},
+    )
+    assert isinstance(spec, TieringOffloadingSpec)
+    region_ctor = MagicMock()
+    monkeypatch.setattr(tiering_spec_module, "SharedOffloadRegion", region_ctor)
+
+    with pytest.raises(ValueError, match="store_threshold is not supported"):
+        spec.get_manager()
+
+    region_ctor.assert_not_called()
+
+
 @pytest.mark.parametrize("world_size", [2, 4, 8])
 def test_tiering_spec_replicated_sizing_removes_world_factor(world_size: int):
     worker_kv_bytes_per_block = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT

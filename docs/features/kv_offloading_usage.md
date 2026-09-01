@@ -129,8 +129,15 @@ The filesystem tier (`type: "fs"`) writes blocks to a filesystem directory.
 | `n_write_threads` | no | `16` | Write-priority I/O threads (store path). |
 | `enable_kv_events` | no | `false` | Publish `BlockStored` KV events (medium `FS`) for successfully stored blocks. Requires KV cache events to be enabled globally. |
 | `locality` | no | unspecified | `LOCAL` or `REMOTE` relative to the publishing vLLM instance. Included in the tier's KV events only when explicitly configured. |
+| `require_o_direct` | no | `false` | Fail startup when the filesystem cannot use `O_DIRECT`, instead of falling back to buffered I/O. |
+| `expected_python_hash_seed` | no | unspecified | Require the effective `PYTHONHASHSEED` to match this string and include it in the persistent configuration identity. |
+| `required_root_mode` | no | unspecified | Require the existing `root_dir` to have this exact numeric permission mode. Use `448` for `0700`. |
 
 Each thread group prefers its own queue but pulls from the other when its primary queue is empty, so a write-heavy or read-heavy burst won't leave the off-priority queue waiting. Size the totals to your storage's effective concurrency.
+
+The filesystem tier currently rejects pipeline parallelism. Its supported
+parallel layout has `pipeline_parallel_size == 1`; startup fails instead of
+creating a separate or partially shared PP namespace.
 
 #### On-Disk Layout
 
@@ -148,7 +155,7 @@ Inside that subdirectory, blocks are sharded across hash-prefix subdirectories t
         <hash_hex>.bin        # full block hash (in hex)
 ```
 
-`config.json` records the run (block size, number of KV groups, etc.) and is written on first start. Each rank writes blocks under its own `_r<rank>` sibling directory, so multiple ranks can safely share the same `root_dir`.
+`config.json` records the run (block size, number of KV groups, etc.) and is written on first start. Each rank writes blocks under its own `_r<rank>` sibling directory, so multiple ranks can safely share the same `root_dir`. A later start validates the existing file and fails if its contents differ from the configuration encoded by the directory name.
 
 #### Cross-Process Sharing
 
@@ -157,6 +164,22 @@ To enable KV cache sharing between multiple vLLM instances using the same `root_
 ```bash
 PYTHONHASHSEED=0 vllm serve ...
 ```
+
+Set `expected_python_hash_seed` when restart reuse is required. The filesystem
+tier then checks the effective environment and includes the seed in both
+`config.json` and the configuration digest, so different seeds cannot share a
+directory by accident.
+
+#### Filesystem I/O metrics
+
+The filesystem tier reports successful block I/O separately from the generic
+GPU-to-CPU offload counters:
+
+- `vllm:kv_offload_fs_store_bytes` and `vllm:kv_offload_fs_store_ops` count new
+  files written. A store skipped because the block file already exists adds
+  neither bytes nor an operation.
+- `vllm:kv_offload_fs_load_bytes` and `vllm:kv_offload_fs_load_ops` count block
+  files read into the CPU primary tier.
 
 ### Object Store (OBJ)
 

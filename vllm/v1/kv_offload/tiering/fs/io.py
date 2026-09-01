@@ -93,13 +93,13 @@ def _store_block(
     offset: int,
     block_size: int,
     use_o_direct: bool = True,
-) -> None:
+) -> bool:
     """
     Store callback: Writes to a temp file then atomically replaces the destination.
     """
     # Check if block already exists to avoid redundant writes
     if os.path.exists(dest_path):
-        return
+        return False
 
     tmp_path = dest_path + _get_tmp_suffix()
     # Ensure parent directories exist
@@ -124,6 +124,7 @@ def _store_block(
         finally:
             os.close(fd)
         os.replace(tmp_path, dest_path)
+        return True
     except Exception:
         try:
             os.remove(tmp_path)
@@ -170,7 +171,7 @@ def batch_store_block(
     offsets: list[int],
     block_size: int,
     use_o_direct: bool = True,
-) -> None:
+) -> int:
     """
     Store a batch of KV blocks from a shared buffer to disk in one call.
 
@@ -183,10 +184,18 @@ def batch_store_block(
         view_B = view.cast("B")
         view_slices = [view_B[x : x + block_size] for x in offsets]
         tmp_paths = [p + _get_tmp_suffix() for p in paths]
-        return batch_store_block_C(tmp_paths, paths, view_slices, use_o_direct)
+        blocks_stored = batch_store_block_C(tmp_paths, paths, view_slices, use_o_direct)
+        if not isinstance(blocks_stored, int):
+            raise RuntimeError(
+                "vllm.fs_io_C is incompatible: batch_store_block must return "
+                "the number of files written"
+            )
+        return blocks_stored
     else:
-        for path, offset in zip(paths, offsets):
+        return sum(
             _store_block(path, view, offset, block_size, use_o_direct)
+            for path, offset in zip(paths, offsets)
+        )
 
 
 def batch_load_block(
@@ -195,7 +204,7 @@ def batch_load_block(
     offsets: list[int],
     block_size: int,
     use_o_direct: bool = True,
-) -> None:
+) -> int:
     """
     Load a batch of KV blocks from disk into a shared buffer in one call.
 
@@ -207,7 +216,14 @@ def batch_load_block(
     if _HAS_FSIO_C:
         view_B = view.cast("B")
         view_slices = [view_B[x : x + block_size] for x in offsets]
-        return batch_load_block_C(paths, view_slices, use_o_direct)
+        blocks_loaded = batch_load_block_C(paths, view_slices, use_o_direct)
+        if not isinstance(blocks_loaded, int):
+            raise RuntimeError(
+                "vllm.fs_io_C is incompatible: batch_load_block must return "
+                "the number of files read"
+            )
+        return blocks_loaded
     else:
         for path, offset in zip(paths, offsets):
             _load_block(path, view, offset, block_size, use_o_direct)
+        return len(paths)

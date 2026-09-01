@@ -39,6 +39,8 @@ Live input is fail-closed: privacy-bearing/unknown fields, control boundaries,
 decode-error markers, request-sequence gaps, incomplete KV groups, and unknown
 schemas abort replay. ``lookup_performed=false`` skips maximal-prefix lookup
 and hit accounting but preserves the request's policy touch and store phases.
+The current consumer accepts only ``group_count=1``: hybrid multi-group replay
+needs per-group chunking/convergence metadata that schema v2 does not expose.
 """
 
 import argparse
@@ -134,6 +136,7 @@ class _RequestAccessRow:
     data_parallel_rank: int
     request_seq: int
     lookup_performed: bool
+    group_count: int
     group_idx: int
     terminal_block_hashes: tuple[int, ...]
 
@@ -158,11 +161,23 @@ _REQUEST_ACCESS_FIELDS = {
     "request_seq",
     "pass_index",
     "lookup_performed",
+    "group_count",
     "group_idx",
     "terminal_block_hashes",
 }
 _REJECTED_TRACE_KINDS = {"sequence_reset", "cleared", "decode_error"}
 _IGNORED_RESIDENCY_KINDS = {"stored", "removed"}
+_RESIDENCY_FIELDS = {
+    "seq",
+    "event_idx",
+    "run_index",
+    "ts",
+    "kind",
+    "medium",
+    "group_idx",
+    "block_hashes",
+}
+_STORED_FIELDS = _RESIDENCY_FIELDS | {"block_size", "num_tokens"}
 
 
 def _ctx() -> ReqContext:
@@ -301,6 +316,18 @@ def _required_int(row: dict[str, Any], field_name: str, line_number: int) -> int
     return cast(int, value)
 
 
+def _required_positive_int(
+    row: dict[str, Any], field_name: str, line_number: int
+) -> int:
+    value = row.get(field_name)
+    _require_trace(
+        isinstance(value, int) and not isinstance(value, bool) and value > 0,
+        line_number,
+        f"{field_name} must be a positive int",
+    )
+    return cast(int, value)
+
+
 def _parse_request_access_row(
     row: dict[str, Any], line_number: int
 ) -> _RequestAccessRow:
@@ -313,7 +340,7 @@ def _parse_request_access_row(
     )
     _require_trace(not missing, line_number, f"missing fields: {missing}")
     _require_trace(
-        row.get("schema_version") == 1,
+        row.get("schema_version") == 2,
         line_number,
         "unsupported request-access schema",
     )
@@ -361,9 +388,63 @@ def _parse_request_access_row(
         data_parallel_rank=_required_int(row, "data_parallel_rank", line_number),
         request_seq=_required_int(row, "request_seq", line_number),
         lookup_performed=cast(bool, lookup_performed),
+        group_count=_required_positive_int(row, "group_count", line_number),
         group_idx=_required_int(row, "group_idx", line_number),
         terminal_block_hashes=tuple(cast(list[int], hashes)),
     )
+
+
+def _validate_residency_row(row: dict[str, Any], line_number: int) -> None:
+    """Validate known collector residency rows before intentionally ignoring them."""
+    kind = cast(str, row["kind"])
+    expected_fields = _STORED_FIELDS if kind == "stored" else _RESIDENCY_FIELDS
+    unexpected = sorted(set(row) - expected_fields)
+    missing = sorted(expected_fields - set(row))
+    _require_trace(
+        not unexpected,
+        line_number,
+        f"unexpected or privacy-sensitive fields: {unexpected}",
+    )
+    _require_trace(not missing, line_number, f"missing fields: {missing}")
+    _required_int(row, "seq", line_number)
+    _required_int(row, "event_idx", line_number)
+    _required_int(row, "run_index", line_number)
+    timestamp = row.get("ts")
+    _require_trace(
+        isinstance(timestamp, int | float) and not isinstance(timestamp, bool),
+        line_number,
+        "ts must be numeric",
+    )
+    medium = row.get("medium")
+    _require_trace(
+        isinstance(medium, str) and bool(medium),
+        line_number,
+        "medium must be a non-empty string",
+    )
+    group_idx = row.get("group_idx")
+    _require_trace(
+        group_idx is None
+        or (
+            isinstance(group_idx, int)
+            and not isinstance(group_idx, bool)
+            and group_idx >= 0
+        ),
+        line_number,
+        "group_idx must be null or a non-negative int",
+    )
+    raw_hashes = row.get("block_hashes")
+    _require_trace(
+        isinstance(raw_hashes, list), line_number, "block_hashes must be a list"
+    )
+    hashes = cast(list[Any], raw_hashes)
+    _require_trace(
+        all(isinstance(value, int) and not isinstance(value, bool) for value in hashes),
+        line_number,
+        "block_hashes must contain integers",
+    )
+    if kind == "stored":
+        _required_positive_int(row, "block_size", line_number)
+        _required_int(row, "num_tokens", line_number)
 
 
 def _parse_jsonl(path: Path) -> list[_RequestAccessRow]:
@@ -389,6 +470,7 @@ def _parse_jsonl(path: Path) -> list[_RequestAccessRow]:
                     line_number, f"trace contains forbidden {kind!r} boundary"
                 )
             if kind in _IGNORED_RESIDENCY_KINDS:
+                _validate_residency_row(row, line_number)
                 continue
             _require_trace(
                 kind == "request_access",
@@ -426,6 +508,19 @@ def _build_request_access_streams(
                 f"duplicate publisher position (first seen at line {previous_line})",
             )
         stream_rows = sorted(unsorted_rows, key=lambda row: row.publisher_position)
+        group_count = stream_rows[0].group_count
+        expected_groups = tuple(range(group_count))
+        for row in stream_rows:
+            _require_trace(
+                row.group_count == group_count,
+                row.line_number,
+                "group_count must be consistent within one stream",
+            )
+            _require_trace(
+                row.group_idx < group_count,
+                row.line_number,
+                "group_idx must be smaller than group_count",
+            )
         _require_trace(
             stream_rows[0].request_seq == 0,
             stream_rows[0].line_number,
@@ -485,18 +580,11 @@ def _build_request_access_streams(
         )
         request_lines.append(current_line)
 
-        all_groups = set().union(*(set(groups) for groups in request_groups))
         canonical_groups = request_groups[0]
-        expected_groups = tuple(range(max(all_groups) + 1))
         _require_trace(
             canonical_groups == expected_groups,
             stream_rows[0].line_number,
             "KV group indices must be complete, ordered, and zero-based",
-        )
-        _require_trace(
-            set(canonical_groups) == all_groups,
-            stream_rows[0].line_number,
-            "first request does not contain the complete group set",
         )
         for index, groups in enumerate(request_groups):
             _require_trace(
@@ -504,6 +592,11 @@ def _build_request_access_streams(
                 request_lines[index],
                 "request group set or group order is incomplete/inconsistent",
             )
+        _require_trace(
+            group_count == 1,
+            stream_rows[0].line_number,
+            "request-access replay supports only single-group traces",
+        )
         streams.append(
             RequestAccessStream(
                 identity=identity,
@@ -558,7 +651,7 @@ def report_request_access_trace(
             "arc+thr2": SimConfig(cache_policy="arc", store_threshold=2),
         }
     report: dict[str, Any] = {
-        "trace_contract": "request-access-v1",
+        "trace_contract": "request-access-v2",
         "streams": len(trace.streams),
         "requests": trace.request_count,
         "block_accesses": trace.block_access_count,

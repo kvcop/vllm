@@ -837,17 +837,19 @@ class OffloadingConnectorScheduler:
 
         req_status.request_access_emitted = True
         req_status.request_seq = next(self._request_seq_counter)
+        group_count = len(self.config.kv_group_configs)
         for group_config, group_state in zip(
             self.config.kv_group_configs, req_status.group_states
         ):
             self._request_access_events.append(
                 RequestAccess(
-                    schema_version=1,
+                    schema_version=2,
                     engine_id=self._request_access_engine_id,
                     data_parallel_rank=self._request_access_dp_rank,
                     request_seq=req_status.request_seq,
                     pass_index=0,
                     lookup_performed=lookup_performed,
+                    group_count=group_count,
                     group_idx=group_config.group_idx,
                     terminal_block_hashes=[
                         get_offload_block_hash(key) for key in group_state.offload_keys

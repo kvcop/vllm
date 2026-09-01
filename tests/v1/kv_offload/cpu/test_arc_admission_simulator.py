@@ -167,6 +167,7 @@ def _access_row(
     data_parallel_rank: int = 0,
     run_index: int = 0,
     lookup_performed: bool = True,
+    group_count: int = 1,
 ) -> dict:
     return {
         "seq": seq,
@@ -174,12 +175,13 @@ def _access_row(
         "run_index": run_index,
         "ts": float(seq),
         "kind": "request_access",
-        "schema_version": 1,
+        "schema_version": 2,
         "engine_id": engine_id,
         "data_parallel_rank": data_parallel_rank,
         "request_seq": request_seq,
         "pass_index": 0,
         "lookup_performed": lookup_performed,
+        "group_count": group_count,
         "group_idx": group_idx,
         "terminal_block_hashes": hashes,
     }
@@ -190,37 +192,40 @@ def _write_jsonl(path: Path, rows: list[dict]) -> Path:
     return path
 
 
+def _residency_row(kind: str, *, block_hash: int) -> dict:
+    row = {
+        "seq": 9,
+        "event_idx": 0,
+        "run_index": 0,
+        "ts": 9.0,
+        "kind": kind,
+        "medium": "CPU",
+        "group_idx": 0,
+        "block_hashes": [block_hash],
+    }
+    if kind == "stored":
+        row.update({"block_size": 16, "num_tokens": 16})
+    return row
+
+
 def test_request_access_trace_restores_publisher_and_request_order(tmp_path: Path):
     high_hash = 901_234_567_890_123
     rows = [
+        _residency_row("stored", block_hash=high_hash + 100),
         # Recovered publisher frames are deliberately written out of order.
         _access_row(
             seq=11,
-            event_idx=1,
-            request_seq=1,
-            group_idx=1,
-            hashes=[high_hash + 3],
-        ),
-        _access_row(
-            seq=10,
-            event_idx=1,
-            request_seq=0,
-            group_idx=1,
-            hashes=[high_hash + 1],
-        ),
-        _access_row(
-            seq=11,
             event_idx=0,
             request_seq=1,
             group_idx=0,
-            hashes=[high_hash, high_hash + 2],
+            hashes=[high_hash, high_hash + 2, high_hash + 3],
         ),
         _access_row(
             seq=10,
             event_idx=0,
             request_seq=0,
             group_idx=0,
-            hashes=[high_hash],
+            hashes=[high_hash, high_hash + 1],
         ),
         # A second publisher may reuse seq/event_idx; validation is per stream.
         _access_row(
@@ -232,15 +237,16 @@ def test_request_access_trace_restores_publisher_and_request_order(tmp_path: Pat
             engine_id="engine-b",
             data_parallel_rank=1,
         ),
+        _residency_row("removed", block_hash=high_hash + 100),
     ]
     trace = load_request_access_trace(_write_jsonl(tmp_path / "trace.jsonl", rows))
 
     assert len(trace.streams) == 2
     first = trace.streams[0]
-    assert first.group_indices == (0, 1)
+    assert first.group_indices == (0,)
     assert tuple(request.blocks for request in first.requests) == (
-        ((0, high_hash), (1, high_hash + 1)),
-        ((0, high_hash), (0, high_hash + 2), (1, high_hash + 3)),
+        ((0, high_hash), (0, high_hash + 1)),
+        ((0, high_hash), (0, high_hash + 2), (0, high_hash + 3)),
     )
     assert tuple(request.blocks for request in trace.streams[1].requests) == (
         ((0, high_hash + 4),),
@@ -250,25 +256,146 @@ def test_request_access_trace_restores_publisher_and_request_order(tmp_path: Pat
     assert summary["requests"] == 3
     assert summary["block_accesses"] == 6
     assert summary["blocks_touched"] == 6
-    assert summary["group_counts"] == [1, 2]
+    assert summary["group_counts"] == [1, 1]
     # Opaque hashes are accepted only as replay keys, never copied to a report.
-    assert str(high_hash) not in json.dumps(summary)
+    serialized = json.dumps(summary)
+    assert str(high_hash) not in serialized
+    assert "engine-a" not in serialized
+    assert "engine-b" not in serialized
 
 
 def test_request_access_trace_rejects_incomplete_group_set(tmp_path: Path):
     rows = [
-        _access_row(seq=1, event_idx=0, request_seq=0, group_idx=0, hashes=[10]),
-        _access_row(seq=1, event_idx=1, request_seq=0, group_idx=1, hashes=[20]),
-        _access_row(seq=2, event_idx=0, request_seq=1, group_idx=0, hashes=[10]),
+        _access_row(
+            seq=1,
+            event_idx=0,
+            request_seq=0,
+            group_idx=0,
+            hashes=[10],
+            group_count=2,
+        ),
+        _access_row(
+            seq=1,
+            event_idx=1,
+            request_seq=0,
+            group_idx=1,
+            hashes=[20],
+            group_count=2,
+        ),
+        _access_row(
+            seq=2,
+            event_idx=0,
+            request_seq=1,
+            group_idx=0,
+            hashes=[10],
+            group_count=2,
+        ),
     ]
 
     with pytest.raises(RequestAccessTraceError, match="incomplete/inconsistent"):
         load_request_access_trace(_write_jsonl(tmp_path / "trace.jsonl", rows))
 
 
+def test_request_access_trace_rejects_uniformly_missing_last_group(tmp_path: Path):
+    rows = [
+        _access_row(
+            seq=1,
+            event_idx=0,
+            request_seq=0,
+            group_idx=0,
+            hashes=[10],
+            group_count=2,
+        ),
+        _access_row(
+            seq=2,
+            event_idx=0,
+            request_seq=1,
+            group_idx=0,
+            hashes=[10],
+            group_count=2,
+        ),
+    ]
+
+    with pytest.raises(RequestAccessTraceError, match="complete, ordered"):
+        load_request_access_trace(_write_jsonl(tmp_path / "trace.jsonl", rows))
+
+
+def test_request_access_trace_rejects_complete_multi_group_replay(tmp_path: Path):
+    rows = [
+        _access_row(
+            seq=1,
+            event_idx=0,
+            request_seq=0,
+            group_idx=0,
+            hashes=[10],
+            group_count=2,
+        ),
+        _access_row(
+            seq=1,
+            event_idx=1,
+            request_seq=0,
+            group_idx=1,
+            hashes=[20],
+            group_count=2,
+        ),
+    ]
+
+    with pytest.raises(RequestAccessTraceError, match="only single-group"):
+        load_request_access_trace(_write_jsonl(tmp_path / "trace.jsonl", rows))
+
+
+def test_request_access_trace_rejects_inconsistent_group_count(tmp_path: Path):
+    rows = [
+        _access_row(
+            seq=1,
+            event_idx=0,
+            request_seq=0,
+            group_idx=0,
+            hashes=[10],
+            group_count=2,
+        ),
+        _access_row(
+            seq=1,
+            event_idx=1,
+            request_seq=0,
+            group_idx=1,
+            hashes=[20],
+            group_count=3,
+        ),
+    ]
+
+    with pytest.raises(RequestAccessTraceError, match="group_count must be consistent"):
+        load_request_access_trace(_write_jsonl(tmp_path / "trace.jsonl", rows))
+
+
+@pytest.mark.parametrize("group_count", [0, -1, True])
+def test_request_access_trace_rejects_invalid_group_count(
+    tmp_path: Path, group_count: int
+):
+    rows = [
+        _access_row(
+            seq=1,
+            event_idx=0,
+            request_seq=0,
+            group_idx=0,
+            hashes=[10],
+            group_count=group_count,
+        ),
+    ]
+
+    with pytest.raises(RequestAccessTraceError, match="group_count must be a positive"):
+        load_request_access_trace(_write_jsonl(tmp_path / "trace.jsonl", rows))
+
+
 def test_request_access_trace_rejects_request_sequence_gap(tmp_path: Path):
     rows = [
-        _access_row(seq=1, event_idx=0, request_seq=0, group_idx=0, hashes=[10]),
+        _access_row(
+            seq=1,
+            event_idx=0,
+            request_seq=0,
+            group_idx=0,
+            hashes=[10],
+        ),
         _access_row(seq=2, event_idx=0, request_seq=2, group_idx=0, hashes=[20]),
     ]
 
@@ -319,7 +446,14 @@ def test_request_access_trace_rejects_mixed_lookup_semantics_within_request(
     tmp_path: Path,
 ):
     rows = [
-        _access_row(seq=1, event_idx=0, request_seq=0, group_idx=0, hashes=[10]),
+        _access_row(
+            seq=1,
+            event_idx=0,
+            request_seq=0,
+            group_idx=0,
+            hashes=[10],
+            group_count=2,
+        ),
         _access_row(
             seq=1,
             event_idx=1,
@@ -327,6 +461,7 @@ def test_request_access_trace_rejects_mixed_lookup_semantics_within_request(
             group_idx=1,
             hashes=[20],
             lookup_performed=False,
+            group_count=2,
         ),
     ]
 
@@ -350,7 +485,7 @@ def test_request_access_trace_rejects_boundaries_and_decode_errors(
 @pytest.mark.parametrize(
     ("field_name", "value", "message"),
     [
-        ("schema_version", 2, "unsupported request-access schema"),
+        ("schema_version", 1, "unsupported request-access schema"),
         ("pass_index", 1, "unsupported request-access pass"),
         ("lookup_performed", 1, "lookup_performed must be bool"),
         ("request_id", "private-id", "privacy-sensitive"),
@@ -369,9 +504,39 @@ def test_request_access_trace_rejects_schema_pass_and_private_fields(
 
 def test_request_access_trace_rejects_duplicate_publisher_position(tmp_path: Path):
     rows = [
-        _access_row(seq=1, event_idx=0, request_seq=0, group_idx=0, hashes=[10]),
-        _access_row(seq=1, event_idx=0, request_seq=0, group_idx=1, hashes=[20]),
+        _access_row(
+            seq=1,
+            event_idx=0,
+            request_seq=0,
+            group_idx=0,
+            hashes=[10],
+            group_count=2,
+        ),
+        _access_row(
+            seq=1,
+            event_idx=0,
+            request_seq=0,
+            group_idx=1,
+            hashes=[20],
+            group_count=2,
+        ),
     ]
 
     with pytest.raises(RequestAccessTraceError, match="duplicate publisher position"):
+        load_request_access_trace(_write_jsonl(tmp_path / "trace.jsonl", rows))
+
+
+@pytest.mark.parametrize("kind", ["stored", "removed"])
+@pytest.mark.parametrize("field_name", ["request_id", "token_ids", "unknown"])
+def test_request_access_trace_rejects_extra_residency_fields(
+    tmp_path: Path, kind: str, field_name: str
+):
+    residency = _residency_row(kind, block_hash=123)
+    residency[field_name] = "private" if field_name != "token_ids" else [1, 2]
+    rows = [
+        residency,
+        _access_row(seq=1, event_idx=0, request_seq=0, group_idx=0, hashes=[10]),
+    ]
+
+    with pytest.raises(RequestAccessTraceError, match="privacy-sensitive"):
         load_request_access_trace(_write_jsonl(tmp_path / "trace.jsonl", rows))

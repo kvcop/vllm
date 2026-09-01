@@ -121,6 +121,7 @@ class RequestAccess(KVCacheEvent):
     request_seq: int
     pass_index: int
     lookup_performed: bool
+    group_count: int
     group_idx: int
     terminal_block_hashes: list[ExternalBlockHash]
 

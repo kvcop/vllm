@@ -190,12 +190,13 @@ def test_request_access_events_preserve_groups_order_and_privacy():
 
     assert [event.group_idx for event in events] == [0, 1]
     assert all(isinstance(event, RequestAccess) for event in events)
-    assert all(event.schema_version == 1 for event in events)
+    assert all(event.schema_version == 2 for event in events)
     assert all(event.engine_id == "trace-engine" for event in events)
     assert all(event.data_parallel_rank == 0 for event in events)
     assert all(event.request_seq == 0 for event in events)
     assert all(event.pass_index == 0 for event in events)
     assert all(event.lookup_performed is True for event in events)
+    assert all(event.group_count == 2 for event in events)
     assert all(event.terminal_block_hashes == hashes for event in events)
 
     batch = KVEventBatch(ts=1.0, events=events)
@@ -212,6 +213,7 @@ def test_request_access_events_preserve_groups_order_and_privacy():
         "request_seq",
         "pass_index",
         "lookup_performed",
+        "group_count",
         "group_idx",
         "terminal_block_hashes",
     }

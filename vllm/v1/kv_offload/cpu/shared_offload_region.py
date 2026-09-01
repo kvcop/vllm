@@ -179,7 +179,9 @@ class SharedOffloadRegion:
                 "MADV_POPULATE_WRITE entire region: %.3f s", time.perf_counter() - _t0
             )
 
-        self._base = torch.frombuffer(memoryview(self.mmap_obj), dtype=torch.int8)
+        self._base: torch.Tensor | None = torch.frombuffer(
+            memoryview(self.mmap_obj), dtype=torch.int8
+        )
         self._views: list[torch.Tensor] = []
         self.is_pinned: bool = False
 
@@ -213,6 +215,7 @@ class SharedOffloadRegion:
             tensor_page_size: Bytes per block for this  tensor.
         """
         assert self.rank is not None
+        assert self._base is not None, "offload region has already been cleaned up"
         new_offset = self._worker_offset + tensor_page_size
         assert new_offset <= self._worker_area_end, (
             f"Worker offset {new_offset} exceeds worker area end "
@@ -235,6 +238,7 @@ class SharedOffloadRegion:
         Shape: (num_blocks, row_stride_bytes). Secondary tiers address
         block *b* as ``view[b]``.
         """
+        assert self._base is not None, "offload region has already been cleaned up"
         kv_tensor = self._base.view(self.num_blocks, self._row_stride)
         np_arr = kv_tensor.numpy()
         assert np_arr.ctypes.data == self._base.data_ptr(), (

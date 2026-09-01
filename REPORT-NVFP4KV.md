@@ -60,13 +60,13 @@ Environment: python 3.13.11, torch 2.11.0+cu129, triton 3.6.0, RTX 4090 Laptop G
 
 | Measurement | Value |
 |---|---|
-| Cache density | 144 B/token/head = 4.5 bits/element (vs 256 B fp16, ~2.2x vs FP8's 1 B/elem scale-free… see note) |
+| Cache density | 144 B/token/head = 4.5 bits/element (fp16 512 B → 3.6x denser; FP8 256 B → 1.78x denser) |
 | Round-trip rel-RMSE vs fp16 (4096 & 8192 tokens, K & V, N(0,1) and 5%-group-outlier) | 0.0951 – 0.0954 |
 | Triton store vs torch reference | bit-identical packed AND scale bytes; gather diff = 0 |
 | Attention (single layer, 1024 ctx) NVFP4-KV vs fp16-KV | cos = 0.9914, rel-L2 = 0.1309 |
 | Attention kernel-correctness isolation (Triton cache vs reference-dequant cache) | rel-L2 = 1.07e-06 |
 
-Density note: 4.5 bits/element is ~1.78x denser than FP8-KV (8 bits + FP8's current scale-free storage in our serving profile), i.e. ~1.8x context capacity per GB, not 2.0x; the "~2x" headline holds only vs the byte-counting that includes fp16 staging buffers.
+Density note: ~1.8x context capacity per GB, not 2.0x; the "~2x" headline holds only vs the byte-counting that includes fp16 staging buffers.
 
 Threshold rationale: the measured rel-RMSE ≈ 0.095 and cos 0.9914 are the **noise floor of the scheme itself** (E2M1, per-16 E4M3 scales, no rotation, no FP32 secondary scale) on synthetic Gaussian data — the port is bit-faithful to it. Test thresholds (rel-RMSE < 0.12, cos > 0.985, rel-L2 < 0.18, kernel isolation < 5e-3) are implementation regression guards, not quality claims.
 

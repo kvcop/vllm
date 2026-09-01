@@ -13,7 +13,7 @@ try:
         batch_load_block as batch_load_block_C,
     )
     from vllm.fs_io_C import (
-        batch_store_block as batch_store_block_C,
+        batch_store_block_results as batch_store_block_results_C,
     )
 
     _HAS_FSIO_C = True
@@ -183,24 +183,46 @@ def batch_store_block(
     Each block buffer[offsets[i] : offsets[i]+block_size] is written atomically
     to dest_paths[i] via an atomic no-overwrite publish. Raises on first error.
     """
+    return sum(
+        batch_store_block_results(paths, view, offsets, block_size, use_o_direct)
+    )
+
+
+def batch_store_block_results(
+    paths: list[str],
+    view: memoryview,
+    offsets: list[int],
+    block_size: int,
+    use_o_direct: bool = True,
+) -> list[bool]:
+    """Store blocks and report which destination each call published."""
     _validate_offsets(view, offsets, block_size)
 
     if _HAS_FSIO_C:
         view_B = view.cast("B")
         view_slices = [view_B[x : x + block_size] for x in offsets]
         tmp_paths = [p + _get_tmp_suffix() for p in paths]
-        blocks_stored = batch_store_block_C(tmp_paths, paths, view_slices, use_o_direct)
-        if not isinstance(blocks_stored, int):
+        stored = batch_store_block_results_C(
+            tmp_paths, paths, view_slices, use_o_direct
+        )
+        if not isinstance(stored, list) or not all(
+            isinstance(value, bool) for value in stored
+        ):
             raise RuntimeError(
-                "vllm.fs_io_C is incompatible: batch_store_block must return "
-                "the number of files written"
+                "vllm.fs_io_C is incompatible: batch_store_block_results must "
+                "return list[bool]"
             )
-        return blocks_stored
+        if len(stored) != len(paths):
+            raise RuntimeError(
+                "vllm.fs_io_C is incompatible: batch_store_block_results "
+                "returned the wrong number of results"
+            )
+        return stored
     else:
-        return sum(
+        return [
             _store_block(path, view, offset, block_size, use_o_direct)
             for path, offset in zip(paths, offsets)
-        )
+        ]
 
 
 def batch_load_block(

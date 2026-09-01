@@ -54,10 +54,15 @@ class JobMetadata:
 
 @dataclass
 class JobResult:
-    """Result of an async transfer job (successful or failed)."""
+    """Result of an async transfer job.
+
+    ``stored`` is set only for store jobs. It distinguishes a successful new
+    publication from a successful idempotent deduplication.
+    """
 
     job_id: JobId
     success: bool
+    stored: bool | None = None
 
 
 class ParentManager(ABC):

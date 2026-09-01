@@ -5,7 +5,7 @@ FileSystemTierManager: Pure-Python file system secondary tier for KV cache offlo
 
 Store path:
     Data is written to a temp file (<dest_path.tmp>) via os.write,
-    then os.replace'd to the final path (without .tmp).
+    then linked to the final path without replacing an existing block.
 
 Load path:
     Data is read from the block file directly via os.readv into the
@@ -58,7 +58,7 @@ from vllm.v1.kv_offload.tiering.base import (
 )
 from vllm.v1.kv_offload.tiering.fs.io import (
     batch_load_block,
-    batch_store_block,
+    batch_store_block_results,
     probe_o_direct,
 )
 from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
@@ -230,8 +230,10 @@ class FileSystemTierManager(SecondaryTierManager):
                     "emit events.",
                     tier_type,
                 )
-        # Keys of in-flight store jobs, tracked only when events are enabled.
+        # Keys and exact per-block publications for in-flight store jobs.
         self._store_job_keys: dict[JobId, list[OffloadKey]] = {}
+        self._store_job_published_keys: dict[JobId, list[OffloadKey]] = {}
+        self._store_job_lock = threading.Lock()
 
         # Extract block size from primary view
         assert primary_kv_view.strides is not None, (
@@ -315,10 +317,13 @@ class FileSystemTierManager(SecondaryTierManager):
 
     @override
     def submit_store(self, job_metadata: JobMetadata) -> None:
-        if self.events is not None:
+        with self._store_job_lock:
             self._store_job_keys[job_metadata.job_id] = list(job_metadata.keys)
+            self._store_job_published_keys[job_metadata.job_id] = []
         task = functools.partial(
             self._store_blocks,
+            job_metadata.job_id,
+            list(job_metadata.keys),
             [self.file_mapper.get_file_name(key) for key in job_metadata.keys],
             self._primary_kv_view,
             [int(bid) * self._block_size for bid in job_metadata.block_ids],
@@ -342,19 +347,24 @@ class FileSystemTierManager(SecondaryTierManager):
 
     def _store_blocks(
         self,
+        job_id: JobId,
+        keys: list[OffloadKey],
         paths: list[str],
         view: memoryview,
         offsets: list[int],
         block_size: int,
         use_o_direct: bool,
     ) -> None:
-        blocks_stored = batch_store_block(
+        stored = batch_store_block_results(
             paths, view, offsets, block_size, use_o_direct
         )
+        published_keys = [key for key, published in zip(keys, stored) if published]
+        with self._store_job_lock:
+            self._store_job_published_keys[job_id] = published_keys
         self._record_io(
             FileSystemTierMetrics.STORE_BYTES,
             FileSystemTierMetrics.STORE_OPS,
-            blocks_stored,
+            len(published_keys),
             block_size,
         )
 
@@ -394,18 +404,20 @@ class FileSystemTierManager(SecondaryTierManager):
         """
         results = []
         for job_id, success in self._pool.get_finished():
-            if self.events is not None:
+            with self._store_job_lock:
                 keys = self._store_job_keys.pop(job_id, None)
-                if success and keys:
-                    self.events.append(
-                        OffloadingEvent(
-                            keys=keys,
-                            medium=self.medium,
-                            removed=False,
-                            locality=self.locality,
-                        )
+                published_keys = self._store_job_published_keys.pop(job_id, [])
+            stored = None if keys is None else success and bool(published_keys)
+            if self.events is not None and success and published_keys:
+                self.events.append(
+                    OffloadingEvent(
+                        keys=published_keys,
+                        medium=self.medium,
+                        removed=False,
+                        locality=self.locality,
                     )
-            results.append(JobResult(job_id=job_id, success=success))
+                )
+            results.append(JobResult(job_id=job_id, success=success, stored=stored))
         return results
 
     @override
@@ -445,3 +457,6 @@ class FileSystemTierManager(SecondaryTierManager):
         """
         self._lookup_manager.shutdown()
         self._pool.shutdown(wait=True)
+        with self._store_job_lock:
+            self._store_job_keys.clear()
+            self._store_job_published_keys.clear()

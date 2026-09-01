@@ -215,7 +215,7 @@ static PyObject* batch_lookup(PyObject* /*self*/, PyObject* args) {
 ///                     (default True). Ignored where O_DIRECT is unsupported
 ///                     by the platform.
 /// @note Releases the GIL for the entire batch. Raises on first error.
-static PyObject* batch_store_block(PyObject* /*self*/, PyObject* args) {
+static PyObject* batch_store_block_impl(PyObject* args, bool return_results) {
   PyObject* tmp_paths_obj = nullptr;
   PyObject* dest_paths_obj = nullptr;
   PyObject* buffers_obj = nullptr;
@@ -248,7 +248,7 @@ static PyObject* batch_store_block(PyObject* /*self*/, PyObject* args) {
 
   Py_ssize_t failed_index = -1;
   int failure_errno = 0;
-  Py_ssize_t blocks_stored = 0;
+  std::vector<int> stored_flags(n);
 
   {
     Py_BEGIN_ALLOW_THREADS for (Py_ssize_t i = 0; i < n; i++) {
@@ -262,7 +262,7 @@ static PyObject* batch_store_block(PyObject* /*self*/, PyObject* args) {
         failure_errno = err;
         break;
       }
-      blocks_stored += stored ? 1 : 0;
+      stored_flags[i] = stored ? 1 : 0;
     }
     Py_END_ALLOW_THREADS
   }
@@ -276,7 +276,30 @@ static PyObject* batch_store_block(PyObject* /*self*/, PyObject* args) {
                                           dest_paths[failed_index]);
   }
 
-  return PyLong_FromSsize_t(blocks_stored);
+  if (!return_results) {
+    Py_ssize_t blocks_stored = 0;
+    for (const int stored : stored_flags) {
+      blocks_stored += stored;
+    }
+    return PyLong_FromSsize_t(blocks_stored);
+  }
+
+  PyObject* result = PyList_New(n);
+  if (result == nullptr) {
+    return nullptr;
+  }
+  for (Py_ssize_t i = 0; i < n; i++) {
+    PyList_SetItem(result, i, PyBool_FromLong(stored_flags[i]));
+  }
+  return result;
+}
+
+static PyObject* batch_store_block(PyObject* /*self*/, PyObject* args) {
+  return batch_store_block_impl(args, false);
+}
+
+static PyObject* batch_store_block_results(PyObject* /*self*/, PyObject* args) {
+  return batch_store_block_impl(args, true);
 }
 
 /// @brief Load a batch of blocks from disk, each into its own buffer.
@@ -354,6 +377,13 @@ static PyMethodDef fs_io_C_methods[] = {
      "\n"
      "Store a batch of blocks, each from its own buffer, to disk. Raises on "
      "first error. Returns the number of new files written."},
+    {"batch_store_block_results", batch_store_block_results, METH_VARARGS,
+     "batch_store_block_results(tmp_paths: list[str], dest_paths: list[str],\n"
+     "                          buffers: list[bytes-like],\n"
+     "                          use_o_direct: bool = True) -> list[bool]\n"
+     "\n"
+     "Store a batch and return whether each destination was newly published. "
+     "Raises on first error."},
     {"batch_load_block", batch_load_block, METH_VARARGS,
      "batch_load_block(source_paths: list[str],\n"
      "                 buffers: list[writable bytes-like],\n"

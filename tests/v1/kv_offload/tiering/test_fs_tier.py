@@ -336,7 +336,9 @@ def test_fs_metrics_count_new_files_and_successful_reads(fs_tier):
     }
 
     tier.submit_store(make_job(2, keys, [0, 1]))
-    assert all(result.success for result in drain(tier))
+    duplicate_results = drain(tier)
+    assert all(result.success for result in duplicate_results)
+    assert all(result.stored is False for result in duplicate_results)
     assert tier.get_stats() is None
 
     tier.submit_load(make_job(3, keys, [2, 3], is_promotion=True))
@@ -349,12 +351,27 @@ def test_fs_metrics_count_new_files_and_successful_reads(fs_tier):
     }
 
 
-def test_concurrent_duplicate_store_counts_exactly_one_publish(fs_tier, monkeypatch):
-    """Two writers past the existence hint still have one publish winner."""
+@pytest.mark.parametrize("use_c_ext", [False, True])
+def test_concurrent_duplicate_store_reports_one_publish_and_event(
+    tmp_path, monkeypatch, use_c_ext
+):
+    """Concurrent idempotent jobs report one publication and one event."""
     import vllm.v1.kv_offload.tiering.fs.io as io_mod
 
-    monkeypatch.setattr(io_mod, "_HAS_FSIO_C", False)
-    tier, tensor = fs_tier
+    if use_c_ext and not io_mod._HAS_FSIO_C:
+        pytest.skip("fs_io_C extension not built")
+    monkeypatch.setattr(io_mod, "_HAS_FSIO_C", use_c_ext)
+    tensor = _page_aligned_zero_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    tier = FileSystemTierManager(
+        offloading_spec=_make_offloading_spec(enable_kv_cache_events=True),
+        primary_kv_view=memoryview(tensor.numpy()),
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=4,
+        n_write_threads=4,
+        enable_kv_events=True,
+        locality="LOCAL",
+    )
     tensor[0].fill_(1.0)
     tensor[1].fill_(2.0)
     duplicate_key = key(42)
@@ -376,26 +393,39 @@ def test_concurrent_duplicate_store_counts_exactly_one_publish(fs_tier, monkeypa
             return False
         return real_exists(path)
 
-    monkeypatch.setattr(io_mod.os.path, "exists", synchronized_exists)
-    tier.submit_store(make_job(1, [duplicate_key], [0]))
-    tier.submit_store(make_job(2, [duplicate_key], [1]))
+    if not use_c_ext:
+        monkeypatch.setattr(io_mod.os.path, "exists", synchronized_exists)
+    try:
+        tier.submit_store(make_job(1, [duplicate_key], [0]))
+        tier.submit_store(make_job(2, [duplicate_key], [1]))
 
-    assert all(result.success for result in drain(tier))
-    assert matching_calls == 2
-    stats = tier.get_stats()
-    assert stats is not None
-    assert stats.reduce() == {
-        FileSystemTierMetrics.STORE_BYTES: tier._block_size,
-        FileSystemTierMetrics.STORE_OPS: 1,
-    }
-    assert os.path.isfile(dest_path)
-    with open(dest_path, "rb") as stored_file:
-        stored = stored_file.read()
-    expected = {
-        tensor[0].numpy().tobytes(),
-        tensor[1].numpy().tobytes(),
-    }
-    assert stored in expected
+        results = drain(tier)
+        assert all(result.success for result in results)
+        stored_results = [result.stored for result in results]
+        assert stored_results.count(True) == 1
+        assert stored_results.count(False) == 1
+        assert matching_calls == (0 if use_c_ext else 2)
+        events = list(tier.take_events())
+        assert len(events) == 1
+        assert events[0].keys == [duplicate_key]
+        assert events[0].medium is Medium.STORAGE
+        stats = tier.get_stats()
+        assert stats is not None
+        assert stats.reduce() == {
+            FileSystemTierMetrics.STORE_BYTES: tier._block_size,
+            FileSystemTierMetrics.STORE_OPS: 1,
+        }
+        assert os.path.isfile(dest_path)
+        assert [str(path) for path in tmp_path.rglob("*.bin")] == [dest_path]
+        with open(dest_path, "rb") as stored_file:
+            stored = stored_file.read()
+        expected = {
+            tensor[0].numpy().tobytes(),
+            tensor[1].numpy().tobytes(),
+        }
+        assert stored in expected
+    finally:
+        tier.shutdown()
 
 
 def test_c_extension_concurrent_duplicate_store_has_one_winner(tmp_path):
@@ -411,19 +441,19 @@ def test_c_extension_concurrent_duplicate_store_has_one_winner(tmp_path):
     payloads = [bytes([index + 1]) * block_size for index in range(2)]
     barrier = threading.Barrier(2)
 
-    def store(index: int) -> int:
+    def store(index: int) -> bool:
         barrier.wait(timeout=5.0)
-        return fs_io_C.batch_store_block(
+        return fs_io_C.batch_store_block_results(
             [temp_paths[index]],
             [destination],
             [memoryview(payloads[index])],
             False,
-        )
+        )[0]
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(executor.map(store, range(2)))
 
-    assert sorted(results) == [0, 1]
+    assert sorted(results) == [False, True]
     assert os.path.isfile(destination)
     with open(destination, "rb") as stored_file:
         assert stored_file.read() in payloads
@@ -788,7 +818,9 @@ def test_successful_store_emits_stored_event(fs_tier_with_events):
     tier = fs_tier_with_events
     keys = [key(1), key(2)]
     tier.submit_store(make_job(1, keys, [0, 1]))
-    assert all(r.success for r in drain(tier))
+    results = drain(tier)
+    assert all(r.success for r in results)
+    assert all(r.stored is True for r in results)
 
     events = list(tier.take_events())
     assert len(events) == 1
@@ -850,14 +882,14 @@ def test_mixed_job_results_emit_event_only_for_successful_job(
 
     tier = fs_tier_with_events
     failing_path = tier.file_mapper.get_file_name(key(1))
-    original_batch_store_block = mgr_mod.batch_store_block
+    original_batch_store_block = mgr_mod.batch_store_block_results
 
     def flaky_batch_store_block(paths, *args, **kwargs):
         if failing_path in paths:
             raise OSError("injected store failure")
         return original_batch_store_block(paths, *args, **kwargs)
 
-    monkeypatch.setattr(mgr_mod, "batch_store_block", flaky_batch_store_block)
+    monkeypatch.setattr(mgr_mod, "batch_store_block_results", flaky_batch_store_block)
 
     tier.submit_store(make_job(1, [key(1)], [0]))
     tier.submit_store(make_job(2, [key(2)], [1]))
@@ -878,14 +910,14 @@ def test_partially_failed_store_emits_no_event(fs_tier_with_events, monkeypatch)
 
     tier = fs_tier_with_events
     failing_path = tier.file_mapper.get_file_name(key(2))
-    original_batch_store_block = mgr_mod.batch_store_block
+    original_batch_store_block = mgr_mod.batch_store_block_results
 
     def flaky_batch_store_block(paths, *args, **kwargs):
         if failing_path in paths:
             raise OSError("injected store failure")
         return original_batch_store_block(paths, *args, **kwargs)
 
-    monkeypatch.setattr(mgr_mod, "batch_store_block", flaky_batch_store_block)
+    monkeypatch.setattr(mgr_mod, "batch_store_block_results", flaky_batch_store_block)
 
     tier.submit_store(make_job(1, [key(1), key(2)], [0, 1]))
     results = drain(tier)

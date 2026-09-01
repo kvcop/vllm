@@ -443,7 +443,9 @@ def _validate_residency_row(row: dict[str, Any], line_number: int) -> None:
         "block_hashes must contain integers",
     )
     if kind == "stored":
-        _required_positive_int(row, "block_size", line_number)
+        # Placeholder events for groups the tracker cannot fully describe use
+        # block_size=0; it is a legitimate collector row, not missing data.
+        _required_int(row, "block_size", line_number)
         _required_int(row, "num_tokens", line_number)
 
 

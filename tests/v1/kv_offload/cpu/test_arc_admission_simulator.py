@@ -540,3 +540,29 @@ def test_request_access_trace_rejects_extra_residency_fields(
 
     with pytest.raises(RequestAccessTraceError, match="privacy-sensitive"):
         load_request_access_trace(_write_jsonl(tmp_path / "trace.jsonl", rows))
+
+
+def test_request_access_trace_accepts_placeholder_stored_block_size_zero(
+    tmp_path: Path,
+):
+    stored = _residency_row("stored", block_hash=123)
+    stored["block_size"] = 0
+    rows = [
+        stored,
+        _access_row(seq=1, event_idx=0, request_seq=0, group_idx=0, hashes=[10]),
+    ]
+
+    trace = load_request_access_trace(_write_jsonl(tmp_path / "trace.jsonl", rows))
+    assert trace.request_count == 1
+
+
+def test_request_access_trace_rejects_stored_row_without_block_size(tmp_path: Path):
+    stored = _residency_row("stored", block_hash=123)
+    del stored["block_size"]
+    rows = [
+        stored,
+        _access_row(seq=1, event_idx=0, request_seq=0, group_idx=0, hashes=[10]),
+    ]
+
+    with pytest.raises(RequestAccessTraceError, match="missing fields.*block_size"):
+        load_request_access_trace(_write_jsonl(tmp_path / "trace.jsonl", rows))

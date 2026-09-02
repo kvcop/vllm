@@ -19,7 +19,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.math_utils import next_power_of_2
-from vllm.utils.torch_utils import is_quantized_kv_cache
+from vllm.utils.torch_utils import is_quantized_kv_cache, nvfp4_kv_cache_full_dim
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -38,6 +38,7 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
+    triton_reshape_and_cache_flash_nvfp4,
     triton_reshape_and_cache_flash_per_token_head_quant,
 )
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
@@ -284,6 +285,7 @@ class TritonAttentionBackend(AttentionBackend):
         "int4_per_token_head",
         "int8_per_token_head",
         "fp8_per_token_head",
+        "nvfp4",
     ]
 
     @staticmethod
@@ -328,6 +330,17 @@ class TritonAttentionBackend(AttentionBackend):
     ) -> tuple[int, ...]:
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
+        # NVFP4 packs K and V into the head dim instead of the content dim:
+        # logical (B, 2*H, N, full_dim) with per-row [data | scales] planes
+        # (same physical layout the FlashInfer SM100 path consumes).
+        if cache_dtype_str == "nvfp4":
+            if head_size % 16 != 0:
+                raise ValueError(
+                    f"NVFP4 KV cache requires head_size divisible by 16, got "
+                    f"{head_size}"
+                )
+            full_dim = nvfp4_kv_cache_full_dim(head_size)
+            return (num_blocks, 2 * num_kv_heads, block_size, full_dim)
         # K and V are packed into the content dim: logical (B, H, N, 2*hs).
         if kv_cache_uses_per_token_head_scales(cache_dtype_str):
             # Pad the head dim by sizeof(float32)/sizeof(cache_dtype) so the
@@ -537,6 +550,18 @@ class TritonAttentionImpl(AttentionImpl):
                     f"{cap_str}); bfloat16 requires SM80+. Re-run with "
                     f"--kv-cache-dtype float16."
                 )
+            if self.kv_cache_dtype == "nvfp4" and not (
+                current_platform.has_device_capability(89)
+            ):
+                # The store/dequant kernels use fp8e4nv (E4M3) conversions in
+                # Triton registers; there is no native FP4 ALU requirement,
+                # but E4M3 needs SM89+ (same floor as the FP8 KV cache).
+                raise ValueError(
+                    f"NVFP4 KV cache is not supported by the Triton attention "
+                    f"backend on {dev} (compute capability {cap_str}); the "
+                    f"packed layout needs fp8e4nv conversions, which require "
+                    f"SM89+. Re-run with --kv-cache-dtype fp8."
+                )
         if logits_soft_cap is None:
             # In flash-attn, setting logits_soft_cap as 0 means no soft cap.
             logits_soft_cap = 0
@@ -641,7 +666,18 @@ class TritonAttentionImpl(AttentionImpl):
         # Per-token-head quantized KV cache: handled by the core unified
         # kernel, which dequantizes per-(token, head) inline via constexpr
         # branches (INT8 / FP8) and dispatches to the packed INT4 kernel.
-        if self._is_per_token_head_quant:
+        # NVFP4: the cache is logical (B, 2*H, N, full_dim); K/V are the two
+        # head halves and the unified kernel dequantizes the [data | scales]
+        # planes online.  No per-tensor descales apply.
+        if self._kv_quant_mode.is_nvfp4:
+            kv_cache_t = kv_cache.transpose(1, 2)
+            nkv = self.num_kv_heads
+            key_cache = kv_cache_t[:, :, :nkv, : self.head_size // 2]
+            value_cache = kv_cache_t[:, :, nkv:, : self.head_size // 2]
+            q_descale = k_descale = v_descale = None
+            k_scale_cache = None
+            v_scale_cache = None
+        elif self._is_per_token_head_quant:
             key_cache, value_cache = self._pth_key_value_caches(kv_cache)
             k_scale_cache = self._k_scale_cache
             v_scale_cache = self._v_scale_cache
@@ -801,6 +837,14 @@ class TritonAttentionImpl(AttentionImpl):
             # we use direct Q, K, V tensors without caching
             return
         # Reshape the input keys and values and store them in the cache.
+        if self._kv_quant_mode.is_nvfp4:
+            triton_reshape_and_cache_flash_nvfp4(
+                key,
+                value,
+                kv_cache,
+                slot_mapping,
+            )
+            return
         if self._is_per_token_head_quant:
             key_cache, value_cache = self._pth_key_value_caches(kv_cache)
             k_scale_cache = self._k_scale_cache
@@ -834,7 +878,7 @@ class TritonAttentionImpl(AttentionImpl):
         )
 
     def fused_rope_kvcache_supported(self):
-        if self._is_per_token_head_quant:
+        if self._is_per_token_head_quant or self._kv_quant_mode.is_nvfp4:
             return False
         return rocm_aiter_ops.is_enabled()
 
@@ -850,6 +894,13 @@ class TritonAttentionImpl(AttentionImpl):
         kv_cache: torch.Tensor,
         layer_slot_mapping: torch.Tensor,
     ):
+        if self._kv_quant_mode.is_nvfp4:
+            # The fused ROCm rope+store kernel only knows the fp16/fp8
+            # content-dim layouts, not the NVFP4 packed planes.
+            raise NotImplementedError(
+                "fused RoPE + KV cache update is not supported with an "
+                "NVFP4 KV cache; use the non-fused update path"
+            )
         # (B, H, N, 2*hs) -> ((B, N, H, hs), (B, N, H, hs))
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
         flash_layout = True

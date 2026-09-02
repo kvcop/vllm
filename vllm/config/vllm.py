@@ -929,6 +929,17 @@ class VllmConfig:
         if (kv_offloading_size := self.cache_config.kv_offloading_size) is None:
             return
 
+        if self.cache_config.cache_dtype == "nvfp4":
+            # The native offloading tier moves KV blocks through per-dtype
+            # shape assumptions that the packed NVFP4 layout (separate
+            # [data | scales] planes, 4.5 bits/element) does not satisfy.
+            # Fail closed until byte-genericity is proven for this dtype.
+            raise ValueError(
+                "CPU KV offloading is not supported with an NVFP4 KV cache; "
+                "remove --kv-offloading-size or use a different "
+                "--kv-cache-dtype."
+            )
+
         kv_offloading_backend = self.cache_config.kv_offloading_backend
 
         # If no KVTransferConfig is provided, create a default one.

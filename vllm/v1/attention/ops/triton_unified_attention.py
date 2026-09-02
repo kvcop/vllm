@@ -28,6 +28,7 @@ from vllm.v1.attention.ops.triton_attention_helpers import (
     softmax_step,
     store_segm_reduce_scalars,
 )
+from vllm.v1.attention.ops.triton_nvfp4_kv import _nvfp4_decode
 from vllm.v1.kv_cache_interface import KVQuantMode
 
 logger = init_logger(__name__)
@@ -47,6 +48,8 @@ def _cast_kv_tile(data, Q, tensor_scale, KV_QUANT_MODE: tl.constexpr):
     - ``KV_QUANT_MODE == 1`` (FP8 per-tensor): dequantize using the
       tensor-wide scale, unless Q is also FP8 and the caller folds the scales
       into the attention score and output accumulator.
+    - ``KV_QUANT_MODE == 5`` (NVFP4): ``data`` arrives already decoded to
+      fp16 by ``_load_kv_nvfp4_tiles``; only the cast to Q's dtype remains.
     """
     if KV_QUANT_MODE == 1:
         if Q.dtype.is_fp8():
@@ -140,6 +143,73 @@ def _load_kv_tile_td(
         block_shape=(TILE_SIZE, HEAD_SIZE_PADDED),
     )
     return desc.load([offset_in_block, 0])
+
+
+@triton.jit
+def _load_kv_nvfp4_tiles(
+    data_ptr,
+    physical_block_idx,  # (TILE_SIZE,) int64 block table entries
+    kv_head_idx,
+    slot_off,  # (TILE_SIZE,) offsets within a physical block
+    tile_mask,  # (TILE_SIZE,) valid-token mask
+    stride_cache_0: tl.int64,
+    stride_cache_1: tl.int64,
+    stride_cache_2: tl.int64,
+    HEAD_SIZE: tl.constexpr,
+    HEAD_SIZE_PADDED: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+):
+    """Load and online-dequantize one NVFP4 KV tile to fp16.
+
+    ``data_ptr`` addresses the packed data plane of one KV side (K or V):
+    logical ``(num_blocks, block_size, num_kv_heads, full_dim)`` uint8 where
+    each row is ``[data (HEAD_SIZE // 2 bytes) | scales (HEAD_SIZE // 16
+    bytes)]``.  Scales sit at byte offset ``HEAD_SIZE // 2`` of the same row,
+    so a single base pointer serves both planes (last-dim stride is 1,
+    enforced by the wrapper).  Decoding shares ``_nvfp4_decode`` with the
+    leaf module so the arithmetic stays bit-identical.
+
+    Returns ``(TILE_SIZE, HEAD_SIZE_PADDED)`` fp16; the caller transposes
+    for K.
+    """
+    row_off = (
+        physical_block_idx * stride_cache_0
+        + kv_head_idx * stride_cache_2
+        + slot_off * stride_cache_1
+    )
+
+    byte_offs = tl.arange(0, HEAD_SIZE_PADDED // 2)
+    byte_mask = byte_offs < HEAD_SIZE // 2
+    packed = tl.load(
+        data_ptr + row_off[:, None] + byte_offs[None, :],
+        mask=tile_mask[:, None] & byte_mask[None, :],
+        other=0,
+    )
+
+    scale_offs = tl.arange(0, HEAD_SIZE_PADDED // 16)
+    scale_mask = scale_offs < HEAD_SIZE // 16
+    scales = (
+        tl.load(
+            data_ptr + row_off[:, None] + HEAD_SIZE // 2 + scale_offs[None, :],
+            mask=tile_mask[:, None] & scale_mask[None, :],
+            other=0,
+        )
+        .to(tl.float8e4nv, bitcast=True)
+        .to(tl.float16)
+    )
+    # One E4M3 scale covers 8 packed bytes = 16 head-dim elements.
+    expanded_scales = tl.reshape(
+        tl.broadcast_to(scales[:, :, None], (TILE_SIZE, HEAD_SIZE_PADDED // 16, 8)),
+        (TILE_SIZE, HEAD_SIZE_PADDED // 2),
+    )
+
+    low = (packed & 15).to(tl.int32)
+    high = (packed >> 4).to(tl.int32)
+    low_values = _nvfp4_decode(low, expanded_scales)
+    high_values = _nvfp4_decode(high, expanded_scales)
+    return tl.reshape(
+        tl.interleave(low_values, high_values), (TILE_SIZE, HEAD_SIZE_PADDED)
+    )
 
 
 @triton.jit
@@ -269,8 +339,8 @@ def kernel_unified_attention(
     stride_vs_head: int | None = None,
     # KV cache quantization mode handled inside this kernel via constexpr
     # branches: NONE (0), FP8_PER_TENSOR (1), INT8_PER_TOKEN_HEAD (2),
-    # FP8_PER_TOKEN_HEAD (3). Sub-byte INT4 (4) uses its own
-    # int4_per_token_head kernel, not this one.
+    # FP8_PER_TOKEN_HEAD (3), NVFP4 packed (5, online-dequant tile loads).
+    # Sub-byte INT4 (4) uses its own int4_per_token_head kernel, not this one.
     KV_QUANT_MODE: tl.constexpr = 0,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
@@ -295,11 +365,20 @@ def kernel_unified_attention(
         KV_QUANT_MODE <= 3
     )
     USE_FP8_Q_DESCALE: tl.constexpr = KV_QUANT_MODE == 1 and Q_IS_FP8
+    # NVFP4 packed KV (mode 5): tiles are online-dequantized in the pointer
+    # load path below.  Tensor-descriptor loads are not applicable (the tile
+    # is unpacked nibbles + block scales, not a plain dtype tile).
+    USE_NVFP4_KV: tl.constexpr = KV_QUANT_MODE == 5
 
     if USE_TD:
         tl.static_assert(
             BLOCK_SIZE % TILE_SIZE == 0,
             "USE_TD requires BLOCK_SIZE to be a multiple of TILE_SIZE",
+        )
+        tl.static_assert(
+            USE_NVFP4_KV == 0,
+            "NVFP4 KV cache does not support tensor-descriptor loads; "
+            "disable USE_TD (set VLLM_TRITON_USE_TD=0 on XPU).",
         )
 
     q_block_global_idx = tl.program_id(0)
@@ -465,30 +544,65 @@ def kernel_unified_attention(
                 HEAD_SIZE_PADDED,
             )
         else:
-            v_offset = (
-                physical_block_idx[:, None] * stride_v_cache_0
-                + kv_head_idx * stride_v_cache_2
-                + offs_d[None, :] * stride_v_cache_3
-                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
-            )
-            k_offset = (
-                physical_block_idx[None, :] * stride_k_cache_0
-                + kv_head_idx * stride_k_cache_2
-                + offs_d[:, None] * stride_k_cache_3
-                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-            )
-            # K : (HEAD_SIZE, TILE_SIZE)
-            K_load = tl.load(
-                key_cache_ptr + k_offset,
-                mask=dim_mask[:, None] & tile_mask[None, :],
-                other=0.0,
-            )
-            # V : (TILE_SIZE, HEAD_SIZE)
-            V_load = tl.load(
-                value_cache_ptr + v_offset,
-                mask=dim_mask[None, :] & tile_mask[:, None],
-                other=0.0,
-            )
+            if USE_NVFP4_KV:
+                # K/V are packed uint8 planes: [data | per-16 E4M3 scales].
+                # Decode to fp16 here so every downstream tiling variant
+                # (prefill, decode, 3D segments) shares one dequant path.
+                K_load = tl.trans(
+                    _load_kv_nvfp4_tiles(
+                        key_cache_ptr,
+                        physical_block_idx,
+                        kv_head_idx,
+                        seq_offset % BLOCK_SIZE,
+                        tile_mask,
+                        stride_k_cache_0,
+                        stride_k_cache_1,
+                        stride_k_cache_2,
+                        HEAD_SIZE,
+                        HEAD_SIZE_PADDED,
+                        TILE_SIZE,
+                    )
+                )
+                # K : (HEAD_SIZE, TILE_SIZE)
+                V_load = _load_kv_nvfp4_tiles(
+                    value_cache_ptr,
+                    physical_block_idx,
+                    kv_head_idx,
+                    seq_offset % BLOCK_SIZE,
+                    tile_mask,
+                    stride_v_cache_0,
+                    stride_v_cache_1,
+                    stride_v_cache_2,
+                    HEAD_SIZE,
+                    HEAD_SIZE_PADDED,
+                    TILE_SIZE,
+                )
+                # V : (TILE_SIZE, HEAD_SIZE)
+            else:
+                v_offset = (
+                    physical_block_idx[:, None] * stride_v_cache_0
+                    + kv_head_idx * stride_v_cache_2
+                    + offs_d[None, :] * stride_v_cache_3
+                    + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+                )
+                k_offset = (
+                    physical_block_idx[None, :] * stride_k_cache_0
+                    + kv_head_idx * stride_k_cache_2
+                    + offs_d[:, None] * stride_k_cache_3
+                    + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+                )
+                # K : (HEAD_SIZE, TILE_SIZE)
+                K_load = tl.load(
+                    key_cache_ptr + k_offset,
+                    mask=dim_mask[:, None] & tile_mask[None, :],
+                    other=0.0,
+                )
+                # V : (TILE_SIZE, HEAD_SIZE)
+                V_load = tl.load(
+                    value_cache_ptr + v_offset,
+                    mask=dim_mask[None, :] & tile_mask[:, None],
+                    other=0.0,
+                )
         K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
         V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
 
@@ -928,6 +1042,34 @@ def unified_attention(
     num_kv_heads = k.shape[2]
     num_queries_per_kv = num_query_heads // num_kv_heads
     head_size = q.shape[2]
+
+    # NVFP4 packed KV: k/v are the uint8 data planes of the packed cache
+    # rows ([data | scales] with the scale plane at byte offset head_size//2,
+    # addressed through the same base pointer).
+    if kv_quant_mode == KVQuantMode.NVFP4:
+        if use_td:
+            raise ValueError(
+                "NVFP4 KV cache does not support tensor-descriptor loads; "
+                "disable use_td (set VLLM_TRITON_USE_TD=0 on XPU)."
+            )
+        if head_size % 32 != 0:
+            raise ValueError(
+                f"NVFP4 KV cache requires head_size divisible by 32, got {head_size}"
+            )
+        if k.dtype != torch.uint8 or v.dtype != torch.uint8:
+            raise ValueError(
+                f"NVFP4 KV cache planes must be uint8, got {k.dtype}/{v.dtype}"
+            )
+        if k.shape[3] != head_size // 2 or v.shape[3] != head_size // 2:
+            raise ValueError(
+                "NVFP4 KV data-plane width must be head_size//2 "
+                f"({head_size // 2}), got {k.shape[3]}/{v.shape[3]}"
+            )
+        if k.stride(3) != 1 or v.stride(3) != 1:
+            raise ValueError(
+                "NVFP4 KV cache planes must have a contiguous packed "
+                "dimension (stride 1)"
+            )
 
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)

@@ -10,6 +10,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import is_quantized_kv_cache
+from vllm.v1.attention.ops.triton_nvfp4_kv import _nvfp4_encode
 from vllm.v1.kv_cache_interface import KVQuantMode
 
 FP8_MIN, FP8_MAX = get_fp8_min_max()
@@ -356,6 +357,164 @@ def triton_reshape_and_cache_flash_per_token_head_quant(
         QUANT_MAX=quant_max,
         QUANT_MIN=quant_min,
         IS_INT_QUANT=cache_dtype == torch.int8,
+        num_warps=num_warps,
+    )
+
+
+# ---------------------------------------------------------------------------
+# NVFP4 packed KV store (E2M1 values + per-16 E4M3 block scales).
+# Grid: (num_tokens, num_kv_heads).  Each program quantizes one (token, head)
+# pair for K and for V and writes both planes of the packed cache row:
+# [data (head_size // 2 bytes) | scales (head_size // 16 bytes)].  The
+# encoding chain is the leaf module's (triton_nvfp4_kv) and is shared with it
+# via _nvfp4_encode, so the stored bytes stay bit-identical to the reference.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _reshape_cache_nvfp4_kernel(
+    key_ptr,  # [num_tokens, num_kv_heads, head_size]
+    value_ptr,  # [num_tokens, num_kv_heads, head_size]
+    cache_ptr,  # logical [num_blocks, 2*num_kv_heads, block_size, full_dim] uint8
+    slot_mapping_ptr,  # [num_tokens]
+    stride_key_tok: tl.int64,
+    stride_key_head: tl.int64,
+    stride_val_tok: tl.int64,
+    stride_val_head: tl.int64,
+    stride_cache_blk: tl.int64,  # logical strides, in uint8 elements
+    stride_cache_head: tl.int64,
+    stride_cache_slot: tl.int64,
+    block_size: tl.constexpr,
+    head_size: tl.constexpr,
+    HEAD_SIZE_PADDED: tl.constexpr,
+):
+    tok = tl.program_id(0)
+    head = tl.program_id(1)
+
+    slot = tl.load(slot_mapping_ptr + tok).to(tl.int64)
+    if slot < 0:
+        return
+
+    blk = slot // block_size
+    slot_in_blk = slot % block_size
+
+    num_kv_heads = tl.num_programs(1)
+    base_k = (
+        blk * stride_cache_blk
+        + head * stride_cache_head
+        + slot_in_blk * stride_cache_slot
+    )
+    base_v = (
+        blk * stride_cache_blk
+        + (head + num_kv_heads) * stride_cache_head
+        + slot_in_blk * stride_cache_slot
+    )
+
+    dim_offs = tl.arange(0, HEAD_SIZE_PADDED)
+    dim_mask = dim_offs < head_size
+    scale_offs = tl.arange(0, HEAD_SIZE_PADDED // 16)
+    scale_mask = scale_offs < head_size // 16
+    packed_offs = tl.arange(0, HEAD_SIZE_PADDED // 2)
+    packed_mask = packed_offs < head_size // 2
+
+    # ---- Key ---------------------------------------------------------------
+    k_h = tl.load(
+        key_ptr + tok * stride_key_tok + head * stride_key_head + dim_offs,
+        mask=dim_mask,
+        other=0.0,
+    )
+    k_amax = tl.max(tl.reshape(tl.abs(k_h), (HEAD_SIZE_PADDED // 16, 16)), axis=1)
+    k_scale_f16 = tl.minimum((k_amax.to(tl.float32) / 6.0).to(tl.float16), 448.0)
+    k_scale = k_scale_f16.to(tl.float8e4nv)
+    tl.store(
+        cache_ptr + base_k + head_size // 2 + scale_offs,
+        k_scale.to(tl.uint8, bitcast=True),
+        mask=scale_mask,
+    )
+    tl.store(
+        cache_ptr + base_k + packed_offs,
+        _nvfp4_encode(k_h, k_scale.to(tl.float16), head_size, HEAD_SIZE_PADDED),
+        mask=packed_mask,
+    )
+
+    # ---- Value -------------------------------------------------------------
+    v_h = tl.load(
+        value_ptr + tok * stride_val_tok + head * stride_val_head + dim_offs,
+        mask=dim_mask,
+        other=0.0,
+    )
+    v_amax = tl.max(tl.reshape(tl.abs(v_h), (HEAD_SIZE_PADDED // 16, 16)), axis=1)
+    v_scale_f16 = tl.minimum((v_amax.to(tl.float32) / 6.0).to(tl.float16), 448.0)
+    v_scale = v_scale_f16.to(tl.float8e4nv)
+    tl.store(
+        cache_ptr + base_v + head_size // 2 + scale_offs,
+        v_scale.to(tl.uint8, bitcast=True),
+        mask=scale_mask,
+    )
+    tl.store(
+        cache_ptr + base_v + packed_offs,
+        _nvfp4_encode(v_h, v_scale.to(tl.float16), head_size, HEAD_SIZE_PADDED),
+        mask=packed_mask,
+    )
+
+
+def triton_reshape_and_cache_flash_nvfp4(
+    key: torch.Tensor,  # [num_tokens, num_kv_heads, head_size]
+    value: torch.Tensor,  # [num_tokens, num_kv_heads, head_size]
+    kv_cache: torch.Tensor,  # logical [num_blocks, 2*H, block_size, full_dim] uint8
+    slot_mapping: torch.Tensor,  # [num_tokens]
+):
+    """Quantize key/value to NVFP4 and store into the packed paged cache.
+
+    ``kv_cache`` is the backend's logical tensor; any physical layout is
+    accepted as long as the packed last dimension is contiguous (stride 1).
+    """
+    num_tokens, num_kv_heads, head_size = key.shape
+    if head_size % 32 != 0:
+        raise ValueError(
+            f"NVFP4 KV cache requires head_size divisible by 32, got {head_size}"
+        )
+    if kv_cache.dtype != torch.uint8 or kv_cache.ndim != 4:
+        raise ValueError(
+            "NVFP4 kv_cache must be a rank-4 uint8 tensor, got "
+            f"{kv_cache.dtype} ndim={kv_cache.ndim}"
+        )
+    if kv_cache.shape[1] != 2 * num_kv_heads:
+        raise ValueError(
+            f"NVFP4 kv_cache head dim must be 2*num_kv_heads ({2 * num_kv_heads}), "
+            f"got {kv_cache.shape[1]}"
+        )
+    expected_full_dim = head_size // 2 + head_size // 16
+    if kv_cache.shape[3] != expected_full_dim:
+        raise ValueError(
+            f"NVFP4 kv_cache full_dim must be {expected_full_dim}, "
+            f"got {kv_cache.shape[3]}"
+        )
+    if kv_cache.stride(3) != 1:
+        raise ValueError(
+            "NVFP4 kv_cache packed dimension must be contiguous "
+            f"(stride 1, got {kv_cache.stride(3)})"
+        )
+
+    head_size_padded = triton.next_power_of_2(head_size)
+    if current_platform.is_rocm() or current_platform.is_xpu():
+        num_warps = 4
+    else:
+        num_warps = min(16, max(1, head_size_padded // 32))
+
+    _reshape_cache_nvfp4_kernel[(num_tokens, num_kv_heads)](
+        key_ptr=key,
+        value_ptr=value,
+        cache_ptr=kv_cache,
+        slot_mapping_ptr=slot_mapping,
+        stride_key_tok=key.stride(0),
+        stride_key_head=key.stride(1),
+        stride_val_tok=value.stride(0),
+        stride_val_head=value.stride(1),
+        stride_cache_blk=kv_cache.stride(0),
+        stride_cache_head=kv_cache.stride(1),
+        stride_cache_slot=kv_cache.stride(2),
+        block_size=kv_cache.shape[2],
+        head_size=head_size,
+        HEAD_SIZE_PADDED=head_size_padded,
         num_warps=num_warps,
     )
 

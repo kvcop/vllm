@@ -1009,7 +1009,7 @@ class TestARCPolicy:
     def test_arc_with_store_threshold_admission_and_ghost_learning(self):
         """
         With store_threshold=2 the admission filter sits in front of ARC:
-        blocks seen in fewer than two lookups are never inserted (so they
+        blocks seen in fewer than two touches are never inserted (so they
         can never reach a ghost list either), admitted blocks enter T1, and
         ghost-list learning keeps working for admitted blocks.
         """
@@ -1017,8 +1017,8 @@ class TestARCPolicy:
             num_blocks=2, enable_events=False, store_threshold=2
         )
 
-        # one lookup is not enough: nothing is stored, all keys skipped
-        cpu_manager.lookup(to_key(1), _EMPTY_REQ_CTX)
+        # one touch is not enough: nothing is stored, all keys skipped
+        cpu_manager.touch(to_keys([1]), ReqContext(req_id="first"))
         prepare_store_output = cpu_manager.prepare_store(
             to_keys([1, 2]), _EMPTY_REQ_CTX
         )
@@ -1026,8 +1026,8 @@ class TestARCPolicy:
         assert prepare_store_output.keys_to_store == []
         assert len(arc_policy.t1) == 0
 
-        # second lookup admits block 1; block 2 stays unseen and filtered
-        cpu_manager.lookup(to_key(1), _EMPTY_REQ_CTX)
+        # second touch admits block 1; block 2 stays unseen and filtered
+        cpu_manager.touch(to_keys([1]), ReqContext(req_id="second"))
         prepare_store_output = cpu_manager.prepare_store(
             to_keys([1, 2]), _EMPTY_REQ_CTX
         )
@@ -1040,14 +1040,14 @@ class TestARCPolicy:
 
         # admitted blocks feed the ghost lists on eviction
         for i in (2, 3, 4):
-            cpu_manager.lookup(to_key(i), _EMPTY_REQ_CTX)
-            cpu_manager.lookup(to_key(i), _EMPTY_REQ_CTX)
+            cpu_manager.touch(to_keys([i]), ReqContext(req_id=f"{i}-first"))
+            cpu_manager.touch(to_keys([i]), ReqContext(req_id=f"{i}-second"))
             cpu_manager.prepare_store(to_keys([i]), _EMPTY_REQ_CTX)
             cpu_manager.complete_store(to_keys([i]), _EMPTY_REQ_CTX)
         assert list(arc_policy.b1) == to_keys([1, 2])
 
         # a once-seen block is filtered and never enters T1 or B1
-        cpu_manager.lookup(to_key(5), _EMPTY_REQ_CTX)
+        cpu_manager.touch(to_keys([5]), ReqContext(req_id="five-first"))
         prepare_store_output = cpu_manager.prepare_store(to_keys([5]), _EMPTY_REQ_CTX)
         assert prepare_store_output is not None
         assert prepare_store_output.keys_to_store == []
@@ -1065,7 +1065,7 @@ class TestARCPolicy:
         assert stats.reduce()[CPUOffloadingMetrics.STORES_SKIPPED] > 0
 
 
-def test_filter_reused_manager():
+def test_filter_reused_manager_counts_touches():
     """
     Tests CPUOffloadingManager reuse filtering (store_threshold=2).
     """
@@ -1076,33 +1076,40 @@ def test_filter_reused_manager():
         store_threshold=2,
         max_tracker_size=3,
     )
-
-    # Lookup [1, 2] -> 1st time, added to tracker but not eligible for store yet
+    # External lookup alone does not count an access. The connector follows it
+    # with touch(), which also covers blocks served by the GPU prefix cache.
     assert manager.lookup(to_key(1), _EMPTY_REQ_CTX) is LookupResult.MISS
-    assert manager.lookup(to_key(2), _EMPTY_REQ_CTX) is LookupResult.MISS
+    assert manager.counts == {}
+
+    # Touch [1, 2] -> 1st access, tracked but not eligible for store yet.
+    first_access = ReqContext(req_id="first")
+    manager.touch(to_keys([1, 2]), first_access)
 
     # prepare store [1, 2] -> should be filtered
     prepare_store_output = manager.prepare_store(to_keys([1, 2]), _EMPTY_REQ_CTX)
     assert prepare_store_output is not None
     assert prepare_store_output.keys_to_store == []
 
-    # Lookup [1] -> 2nd time, eligible now
-    assert manager.lookup(to_key(1), _EMPTY_REQ_CTX) is LookupResult.MISS
+    # Touch [1] -> 2nd access, eligible now.
+    second_access = ReqContext(req_id="second")
+    manager.touch(to_keys([1]), second_access)
+    manager.touch(to_keys([1]), second_access)
+    assert manager.counts is not None
+    assert manager.counts[to_key(1)] == 2
 
     # prepare store [1, 2] -> [1] should be eligible, [2] should be filtered
     prepare_store_output = manager.prepare_store(to_keys([1, 2]), _EMPTY_REQ_CTX)
     assert prepare_store_output is not None
     assert prepare_store_output.keys_to_store == to_keys([1])
 
-    # Lookup [3, 4] -> 1st time
+    # Touch [3, 4] -> 1st access
     # (evicts [2] from tracker since max_size is 3 and tracker has [1])
-    assert manager.lookup(to_key(3), _EMPTY_REQ_CTX) is LookupResult.MISS
-    assert manager.lookup(to_key(4), _EMPTY_REQ_CTX) is LookupResult.MISS
+    manager.touch(to_keys([3, 4]), ReqContext(req_id="third"))
     # Verify [2] was evicted from the tracker (tracker now has: [1], [3], [4])
     assert to_keys([2])[0] not in manager.counts
 
-    # Lookup [2] again -> (this adds [2] back to the tracker as 1st time)
-    assert manager.lookup(to_key(2), _EMPTY_REQ_CTX) is LookupResult.MISS
+    # Touch [2] again -> (this adds [2] back to the tracker as 1st access)
+    manager.touch(to_keys([2]), ReqContext(req_id="fourth"))
     # Verify [2] was re-added with count=1 (not eligible yet)
     assert manager.counts.get(to_keys([2])[0]) == 1
 
@@ -1112,6 +1119,43 @@ def test_filter_reused_manager():
     assert prepare_store_output.keys_to_store == []
 
     manager.complete_store(to_keys([1]), _EMPTY_REQ_CTX)
+
+
+def test_skip_reading_request_does_not_advance_admission(monkeypatch):
+    """A skip_reading_prefix_cache request must not advance admission.
+
+    It deliberately forbids prefix-cache reuse, so its touches (however many
+    scheduler steps repeat them) leave the admission tracker untouched, while
+    policy recency is still refreshed.
+    """
+    manager = make_cpu_manager(num_blocks=4, store_threshold=2)
+    policy_touches: list[list[OffloadKey]] = []
+
+    def spy_touch(keys: Iterable[OffloadKey], req_context: ReqContext) -> None:
+        policy_touches.append(list(keys))
+
+    monkeypatch.setattr(manager._policy, "touch", spy_touch)
+
+    skip_ctx = ReqContext(req_id="skip", skip_reading_prefix_cache=True)
+    manager.touch(to_keys([1, 2]), skip_ctx)
+    # Repeated scheduler touches for the same request still count once —
+    # and here not at all.
+    manager.touch(to_keys([1, 2]), skip_ctx)
+
+    assert manager.counts == {}
+    assert policy_touches == [to_keys([1, 2]), to_keys([1, 2])]
+
+    prepare_store_output = manager.prepare_store(to_keys([1, 2]), skip_ctx)
+    assert prepare_store_output is not None
+    assert prepare_store_output.keys_to_store == []
+
+    # A later reading request starts from a clean admission count.
+    manager.touch(to_keys([1]), ReqContext(req_id="reader"))
+    assert manager.counts is not None
+    assert manager.counts[to_key(1)] == 1
+    prepare_store_output = manager.prepare_store(to_keys([1]), _EMPTY_REQ_CTX)
+    assert prepare_store_output is not None
+    assert prepare_store_output.keys_to_store == []
 
 
 def test_evictable_cache_block_count():

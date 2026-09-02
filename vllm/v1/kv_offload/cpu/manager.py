@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import OrderedDict
 from collections.abc import Collection, Iterable
+from dataclasses import dataclass, field
 
 from typing_extensions import override
 
@@ -25,6 +26,11 @@ from vllm.v1.kv_offload.cpu.common import (
 )
 from vllm.v1.kv_offload.cpu.policies.base import BlockStatus, CachePolicy
 from vllm.v1.kv_offload.cpu.policies.factory import CachePolicyFactory
+
+
+@dataclass
+class _AdmissionState:
+    touched_keys: set[OffloadKey] = field(default_factory=set)
 
 
 class CPUOffloadingManager(OffloadingManager):
@@ -67,10 +73,38 @@ class CPUOffloadingManager(OffloadingManager):
         self.stores_skipped_in_current_batch: int = 0
         self.allocation_sizes_in_current_batch: list[int] = []
 
-        # Number of block references. It is ordered so can evict the LRU entry in O(1).
+        # Number of request-level access touches per block. It is ordered so the
+        # LRU tracker entry can be evicted in O(1).
         self.counts: OrderedDict[OffloadKey, int] | None = (
             OrderedDict() if store_threshold >= 2 else None
         )
+
+    def _track_accesses(
+        self, keys: Iterable[OffloadKey], req_context: ReqContext
+    ) -> None:
+        counts = self.counts
+        if counts is None:
+            return
+        # A request that deliberately forbids prefix-cache reuse must not
+        # advance admission: its touches do not represent cache reuse.
+        # Recency is still refreshed by the policy touch below.
+        if req_context.skip_reading_prefix_cache:
+            return
+        state = req_context.get_state(_AdmissionState)
+        if state is None:
+            state = _AdmissionState()
+            req_context.set_state(state)
+        for key in keys:
+            if key in state.touched_keys:
+                continue
+            state.touched_keys.add(key)
+            if key in counts:
+                counts.move_to_end(key)
+                counts[key] += 1
+            else:
+                if len(counts) >= self.max_tracker_size:
+                    counts.popitem(last=False)
+                counts[key] = 1
 
     # --- block pool ---
 
@@ -111,14 +145,6 @@ class CPUOffloadingManager(OffloadingManager):
 
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
-        if self.counts is not None:
-            if key in self.counts:
-                self.counts.move_to_end(key)
-                self.counts[key] += 1
-            else:
-                if len(self.counts) >= self.max_tracker_size:
-                    self.counts.popitem(last=False)
-                self.counts[key] = 1
         block = self._policy.get(key)
         if block is None:
             return LookupResult.MISS
@@ -147,6 +173,7 @@ class CPUOffloadingManager(OffloadingManager):
 
     @override
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
+        self._track_accesses(keys, req_context)
         self._policy.touch(keys, req_context)
 
     @override
@@ -162,16 +189,33 @@ class CPUOffloadingManager(OffloadingManager):
                 self._num_evictable_cache_blocks += 1  # ref_cnt 1 -> 0
                 self._policy.mark_evictable(key)
 
+    def admit_store_keys(self, keys: Collection[OffloadKey]) -> list[OffloadKey]:
+        """Filter ``keys`` down to those that passed store admission.
+
+        With store_threshold >= 2 only keys whose request-level access count
+        reached the threshold are admitted; the skipped count is recorded for
+        the STORES_SKIPPED metric. Thresholds < 2 admit everything.
+        """
+        counts = self.counts
+        if counts is None:
+            return list(keys)
+        admitted = [k for k in keys if counts.get(k, 0) >= self.store_threshold]
+        self.stores_skipped_in_current_batch += len(keys) - len(admitted)
+        return admitted
+
     @override
     def prepare_store(
         self,
         keys: Collection[OffloadKey],
         req_context: ReqContext,
     ) -> PrepareStoreOutput | None:
-        if self.counts is not None:
-            num_keys = len(keys)
-            keys = [k for k in keys if self.counts.get(k, 0) >= self.store_threshold]
-            self.stores_skipped_in_current_batch += num_keys - len(keys)
+        return self._prepare_store_admitted(self.admit_store_keys(keys), req_context)
+
+    def _prepare_store_admitted(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> PrepareStoreOutput | None:
         # filter out blocks that are already stored
         keys_to_store = [k for k in keys if self._policy.get(k) is None]
 

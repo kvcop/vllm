@@ -95,12 +95,16 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
         cache_policy: str = "lru",
         cache_policy_module_path: str | None = None,
         enable_events: bool = False,
+        store_threshold: int = 1,
+        max_tracker_size: int = 64_000,
     ):
         super().__init__(
             num_blocks=num_blocks,
             cache_policy=cache_policy,
             cache_policy_module_path=cache_policy_module_path,
             enable_events=enable_events,
+            store_threshold=store_threshold,
+            max_tracker_size=max_tracker_size,
         )
         self._mmap_region = mmap_region
         # read/write is for CPU<->secondary transfers,
@@ -108,10 +112,23 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
         # These aliases avoid calling prepare_load inside a store path.
         self.prepare_read = self.prepare_load
         self.complete_read = self.complete_load
-        self.prepare_write = self.prepare_store
+        self.prepare_write = self._prepare_store_admitted
         self.complete_write = self.complete_store
 
         self._kv_memoryview = mmap_region.create_kv_memoryview()
+
+    @override
+    def prepare_store(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> PrepareStoreOutput | None:
+        # Admission for GPU->primary stores is decided by
+        # TieringOffloadingManager.prepare_store() before this call, so a
+        # rejected one-shot key creates no primary-tier object. Secondary->
+        # primary promotion (prepare_write) shares the unfiltered path: a
+        # block promoted from a secondary tier must not be re-admitted.
+        return self._prepare_store_admitted(keys, req_context)
 
     def get_kv_memoryview(self) -> memoryview:
         """Return the memoryview over the primary tier's KV cache buffer.
@@ -534,9 +551,13 @@ class TieringOffloadingManager(OffloadingManager):
         self._maybe_process_finished_jobs()
 
         # Step 2: Store to primary tier (new blocks only).
+        # Admission runs first so a rejected one-shot key creates neither a
+        # primary-tier (CPU) object nor — via the later cascade of stored
+        # keys — any secondary-tier object.
         # Cascading of these newly-stored blocks to ALL secondary tiers
         # happens later in complete_store(), after the GPU→Primary transfer
         # completes.
+        keys = self.primary_tier.admit_store_keys(keys)
         primary_result = self.primary_tier.prepare_store(keys, req_context)
 
         if primary_result is None:

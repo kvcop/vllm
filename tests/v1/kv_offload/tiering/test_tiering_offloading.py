@@ -38,6 +38,13 @@ from vllm.v1.kv_offload.base import (
     TierMatcher,
     make_offload_key,
 )
+from vllm.v1.kv_offload.config import (
+    OffloadingCacheConfig,
+    OffloadingConfig,
+    OffloadingModelConfig,
+    OffloadingParallelConfig,
+)
+from vllm.v1.kv_offload.cpu.common import CPUOffloadingMetrics
 from vllm.v1.kv_offload.tiering.base import (
     JobMetadata,
     JobResult,
@@ -1129,6 +1136,157 @@ def test_parse_tier_filter_skips_bad_entries():
     assert result.matchers == (
         TierMatcher(medium=Medium.STORAGE),
         TierMatcher(medium=Medium.CPU),
+    )
+
+
+class TestTieringStoreAdmission:
+    """store_threshold admission in the tiering orchestrator.
+
+    The admission filter runs before primary_tier.prepare_store and before
+    any secondary cascade, so a rejected one-shot key creates neither a CPU
+    nor a secondary-tier object. Secondary-to-primary promotion bypasses
+    new-store admission.
+    """
+
+    @pytest.fixture
+    def admission_setup(self):
+        mock_region = _mock_mmap_region(8)
+        self.primary_tier = CPUPrimaryTierOffloadingManager(
+            num_blocks=8, mmap_region=mock_region, store_threshold=2
+        )
+        self.secondary_tier = ExampleSecondaryTierManager(
+            offloading_spec=_MOCK_OFFLOADING_SPEC,
+            primary_kv_view=mock_region.create_kv_memoryview(),
+            tier_type="example",
+        )
+        self.manager = TieringOffloadingManager(
+            primary_tier=self.primary_tier,
+            secondary_tiers=[self.secondary_tier],
+        )
+        self.first_ctx = ReqContext(req_id="first")
+        self.second_ctx = ReqContext(req_id="second")
+        self.manager.on_new_request(self.first_ctx)
+        self.manager.on_new_request(self.second_ctx)
+
+    def test_rejected_one_shot_keys_create_no_objects(self, admission_setup):
+        keys = to_keys([1, 2])
+        self.manager.touch(keys, self.first_ctx)
+
+        store_output = self.manager.prepare_store(keys, self.first_ctx)
+        assert store_output is not None
+        assert store_output.keys_to_store == []
+        assert all(self.primary_tier._policy.get(k) is None for k in keys)
+        assert self.secondary_tier.blocks == {}
+
+        stats = self.primary_tier.get_stats()
+        assert stats is not None
+        assert stats.reduce()[CPUOffloadingMetrics.STORES_SKIPPED] == 2
+
+    def test_admitted_keys_cascade_and_rejected_filler_is_dropped(
+        self, admission_setup
+    ):
+        keys = to_keys([1, 2])
+        # Key 1 is touched by both requests; key 2 stays a one-shot filler.
+        self.manager.touch([keys[0]], self.first_ctx)
+        self.manager.touch(keys, self.second_ctx)
+
+        store_output = self.manager.prepare_store(keys, self.second_ctx)
+        assert store_output is not None
+        assert store_output.keys_to_store == [keys[0]]
+
+        self.manager.complete_store([keys[0]], self.second_ctx, success=True)
+
+        assert set(self.secondary_tier.blocks) == {keys[0]}
+        assert self.primary_tier.lookup(keys[0], self.second_ctx) is LookupResult.HIT
+        assert self.primary_tier._policy.get(keys[1]) is None
+        assert self.secondary_tier.lookup(keys[1], self.second_ctx) is LookupResult.MISS
+
+    def test_promotion_bypasses_store_admission(self, admission_setup):
+        key = to_keys([7])[0]
+        # Data lives only in the secondary tier and was never touched, so
+        # its admission count is zero.
+        self.secondary_tier.blocks[key] = True
+        assert self.primary_tier.counts is not None
+        assert self.primary_tier.counts.get(key, 0) == 0
+
+        # The secondary hit still initiates a promotion.
+        assert self.manager.lookup(key, self.first_ctx) is LookupResult.RETRY
+
+        self.manager.on_schedule_end(
+            ScheduleEndContext(new_req_ids=[], preempted_req_ids=())
+        )
+
+        # The synchronous example tier finished the load; the next lookup
+        # processes it and the promoted block is readable in the primary tier.
+        assert self.manager.lookup(key, self.first_ctx) is LookupResult.HIT
+
+
+def _make_tiering_spec_config(extra_config: dict) -> OffloadingConfig:
+    return OffloadingConfig(
+        groups=(),
+        worker_kv_bytes_per_block=0,
+        enable_kv_cache_events=False,
+        extra_config=extra_config,
+        engine_id="test-engine",
+        model=OffloadingModelConfig(name="test/model", dtype="float16"),
+        cache=OffloadingCacheConfig(tokens_per_hash=16, blocks_per_chunk=1),
+        parallel=OffloadingParallelConfig(
+            rank=0,
+            world_size=1,
+            tp_size=1,
+            pp_size=1,
+            pcp_size=1,
+            dcp_size=1,
+            data_parallel_index=0,
+            is_parallelism_agnostic=False,
+        ),
+    )
+
+
+def test_tiering_spec_rejects_bad_store_config_before_region_allocation(monkeypatch):
+    """Invalid admission config fails in the spec constructor, before any
+    SharedOffloadRegion is allocated."""
+
+    def _forbidden(*args, **kwargs):
+        raise AssertionError(
+            "SharedOffloadRegion must not be allocated for an invalid config"
+        )
+
+    monkeypatch.setattr(
+        "vllm.v1.kv_offload.tiering.spec.SharedOffloadRegion", _forbidden
+    )
+
+    for extra_config in (
+        {"cpu_bytes_to_use": 1 << 20, "store_threshold": -1},
+        {"cpu_bytes_to_use": 1 << 20, "max_tracker_size": 0},
+    ):
+        with pytest.raises(ValueError):
+            TieringOffloadingSpec(_make_tiering_spec_config(extra_config))
+
+
+def test_tiering_spec_configures_primary_store_admission(monkeypatch):
+    monkeypatch.setattr(
+        "vllm.v1.kv_offload.tiering.spec.SharedOffloadRegion",
+        lambda **kwargs: _mock_mmap_region(4),
+    )
+
+    spec = TieringOffloadingSpec(
+        _make_tiering_spec_config(
+            {
+                "cpu_bytes_to_use": 1 << 20,
+                "store_threshold": 2,
+                "max_tracker_size": 128,
+            }
+        )
+    )
+    manager = spec.get_manager()
+    assert isinstance(manager, TieringOffloadingManager)
+    assert manager.primary_tier.store_threshold == 2
+    assert manager.primary_tier.max_tracker_size == 128
+    assert manager.primary_tier.counts is not None
+    assert (
+        CPUOffloadingMetrics.STORES_SKIPPED
+        in TieringOffloadingSpec.build_metric_definitions({"store_threshold": 2})
     )
 
 

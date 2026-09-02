@@ -4,10 +4,11 @@ import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from itertools import chain, islice
+from itertools import count as itertools_count
 from typing import Any, NamedTuple
 
 from vllm.config import VllmConfig
-from vllm.distributed.kv_events import KVCacheEvent
+from vllm.distributed.kv_events import KVCacheEvent, RequestAccess
 from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
@@ -51,6 +52,7 @@ from vllm.v1.kv_offload.base import (
     ScheduleEndContext,
     TierFilter,
     TierMatcher,
+    get_offload_block_hash,
     make_offload_key,
 )
 from vllm.v1.outputs import KVConnectorOutput
@@ -275,6 +277,8 @@ class RequestOffloadState:
     req: Request
     req_context: ReqContext
     offloading_context: RequestOffloadingContext
+    request_seq: int = -1
+    request_access_emitted: bool = False
     group_states: tuple[RequestGroupState, ...] = field(init=False)
     # upper bound on tokens to offload for this request; None means no cap
     max_offload_tokens: int | None = None
@@ -439,6 +443,7 @@ def _create_req_context(req: Request) -> ReqContext:
         req_id=req.request_id,
         kv_transfer_params=params,
         load_tier_filter=load_filter,
+        skip_reading_prefix_cache=req.skip_reading_prefix_cache,
     )
 
 
@@ -506,6 +511,18 @@ class OffloadingConnectorScheduler:
         self._block_id_to_pending_jobs: dict[int, set[int]] = {}
 
         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
+        self._request_access_events_enabled = (
+            spec.kv_events_config.enable_kv_cache_events
+            and spec.kv_events_config.request_access_events
+        )
+        self._request_seq_counter = itertools_count()
+        self._request_access_events: list[RequestAccess] = []
+        kv_transfer_config = vllm_config.kv_transfer_config
+        assert kv_transfer_config is not None
+        self._request_access_engine_id = (
+            kv_transfer_config.engine_id or vllm_config.instance_id
+        )
+        self._request_access_dp_rank = vllm_config.parallel_config.data_parallel_index
 
     def _maybe_observe_lookup_async_delay(
         self, req_status: RequestOffloadState
@@ -813,6 +830,34 @@ class OffloadingConnectorScheduler:
         )
         self._req_status[request.request_id] = req_status
 
+    def _record_request_access(
+        self, req_status: RequestOffloadState, *, lookup_performed: bool
+    ) -> None:
+        if not self._request_access_events_enabled or req_status.request_access_emitted:
+            return
+
+        req_status.request_access_emitted = True
+        req_status.request_seq = next(self._request_seq_counter)
+        group_count = len(self.config.kv_group_configs)
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
+            self._request_access_events.append(
+                RequestAccess(
+                    schema_version=2,
+                    engine_id=self._request_access_engine_id,
+                    data_parallel_rank=self._request_access_dp_rank,
+                    request_seq=req_status.request_seq,
+                    pass_index=0,
+                    lookup_performed=lookup_performed,
+                    group_count=group_count,
+                    group_idx=group_config.group_idx,
+                    terminal_block_hashes=[
+                        get_offload_block_hash(key) for key in group_state.offload_keys
+                    ],
+                )
+            )
+
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
     ) -> tuple[int | None, bool]:
@@ -847,6 +892,10 @@ class OffloadingConnectorScheduler:
             return None, False
 
         req_status.update_offload_keys()
+        self._record_request_access(
+            req_status,
+            lookup_performed=not request.skip_reading_prefix_cache,
+        )
         req_status.num_locally_computed_tokens = num_computed_tokens
 
         num_hit_tokens: int | None
@@ -1434,6 +1483,9 @@ class OffloadingConnectorScheduler:
             ``BlockStored`` or ``BlockRemoved`` events corresponding to
             the underlying :class:`OffloadingEvent` stream.
         """
+        request_access_events = self._request_access_events
+        self._request_access_events = []
+        yield from request_access_events
         yield from self._events_tracker.take_events(self.manager.take_events())
 
     def reset_cache(self) -> None:

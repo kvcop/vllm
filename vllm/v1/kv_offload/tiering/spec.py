@@ -16,6 +16,12 @@ Configuration via kv_connector_extra_config:
   - cache_policy_module_path: (optional) Python import path to load
     eviction_policy from when it names an out-of-tree CachePolicy not
     registered via CachePolicyFactory
+  - store_threshold: (optional) How many requests must touch a block before
+    it is eligible for a new GPU->primary store (default: 0 = store
+    everything). Rejected one-shot keys create neither a CPU nor a secondary
+    object; secondary->primary promotion bypasses this admission.
+  - max_tracker_size: (optional) Maximum entries in the admission tracker's
+    LRU table (default: 64_000)
   - secondary_tiers: (optional) List of secondary tier configurations
     Each secondary tier config is a dict with:
       - type: (required) Type of secondary tier (e.g., "example", "storage", "network")
@@ -142,6 +148,21 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
         # Redeclare for mypy: parent sets this but `--follow-imports skip` hides it
         self._manager: OffloadingManager | None = None
 
+        # Validate the store-admission config here, before any
+        # SharedOffloadRegion (scheduler- or worker-side) can be allocated in
+        # get_manager()/create_worker(): a bad value must fail fast instead
+        # of surfacing after the mmap region exists.
+        self.store_threshold = int(self.extra_config.get("store_threshold", 0))
+        if self.store_threshold < 0:
+            raise ValueError(
+                f"store_threshold must be >= 0, got {self.store_threshold}"
+            )
+        self.max_tracker_size = int(self.extra_config.get("max_tracker_size", 64_000))
+        if self.max_tracker_size < 1:
+            raise ValueError(
+                f"max_tracker_size must be >= 1, got {self.max_tracker_size}"
+            )
+
         # Parse secondary tier configurations
         self.secondary_tier_configs = self.extra_config.get("secondary_tiers", [])
         if not isinstance(self.secondary_tier_configs, list):
@@ -179,13 +200,16 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             )
             self._scheduler_mmap = scheduler_mmap
 
-            # Create primary tier (CPU-based)
+            # Create primary tier (CPU-based). store_threshold/max_tracker_size
+            # were validated in __init__ before this region was allocated.
             primary_tier = CPUPrimaryTierOffloadingManager(
                 num_blocks=self.num_blocks,
                 cache_policy=self.eviction_policy,
                 cache_policy_module_path=self.cache_policy_module_path,
                 enable_events=self.kv_events_config.enable_kv_cache_events,
                 mmap_region=scheduler_mmap,
+                store_threshold=self.store_threshold,
+                max_tracker_size=self.max_tracker_size,
             )
 
             # Create secondary tiers
@@ -217,10 +241,6 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 primary_tier=primary_tier,
                 secondary_tiers=secondary_tiers,
             )
-            if int(self.extra_config.get("store_threshold", 0)) >= 2:
-                raise ValueError(
-                    "store_threshold is not supported for TieringOffloadingSpec"
-                )
             self._manager = tiering_manager
 
             logger.info(

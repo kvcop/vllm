@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call
 
+import msgspec
 import pytest
 import torch
 
@@ -16,7 +17,14 @@ from tests.v1.kv_connector.unit.offloading_connector.utils import (
     to_keys,
 )
 from tests.v1.kv_connector.unit.utils import EOS_TOKEN_ID
-from vllm.distributed.kv_events import MEDIUM_CPU, BlockRemoved, BlockStored
+from vllm.config import KVEventsConfig
+from vllm.distributed.kv_events import (
+    MEDIUM_CPU,
+    BlockRemoved,
+    BlockStored,
+    KVEventBatch,
+    RequestAccess,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
     OffloadingWorkerMetadata,
@@ -31,6 +39,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
     RequestOffloadState,
+    _create_req_context,
     is_store_reachable_swa_chunk,
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -55,6 +64,7 @@ from vllm.v1.kv_offload.base import (
     get_offload_block_hash,
     make_offload_key,
 )
+from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
 
@@ -112,6 +122,174 @@ def test_recurrent_unhashed_block_does_not_truncate_load_boundary():
     assert 42 in loaded
 
 
+def _make_request_access_scheduler(
+    enabled: bool | None, *, kv_events_enabled: bool = True
+):
+    extra_config = {} if enabled is None else {"request_access_events": enabled}
+    vllm_config = _make_vllm_config(extra_config=extra_config)
+    vllm_config.kv_events_config = KVEventsConfig(
+        enable_kv_cache_events=kv_events_enabled,
+        publisher="null",
+    )
+    vllm_config.kv_transfer_config.engine_id = "trace-engine"
+    kv_cache_config = _make_mamba_hybrid_kv_cache_config()
+    spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
+    spec.manager.take_events.return_value = []
+    scheduler = OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
+    return scheduler
+
+
+def _add_request_access_request(
+    scheduler: OffloadingConnectorScheduler,
+    request_id: str,
+    hashes: list[BlockHash],
+):
+    request = MagicMock()
+    request.request_id = request_id
+    request.kv_transfer_params = None
+    request.num_prompt_tokens = len(hashes) * 16
+    request.num_tokens = request.num_prompt_tokens
+    request.block_hashes = hashes
+    request.skip_reading_prefix_cache = False
+    request.is_finished.return_value = False
+    scheduler.on_new_request(request)
+    return request
+
+
+@pytest.mark.parametrize(
+    ("enabled", "kv_events_enabled"),
+    [(None, True), (False, True), (True, False)],
+)
+def test_request_access_events_require_both_opt_ins(
+    enabled: bool | None, kv_events_enabled: bool
+):
+    scheduler = _make_request_access_scheduler(
+        enabled=enabled,
+        kv_events_enabled=kv_events_enabled,
+    )
+    request = _add_request_access_request(
+        scheduler,
+        "private-request-id",
+        [BlockHash(b"hash-0")],
+    )
+
+    scheduler.get_num_new_matched_tokens(request, 0)
+
+    assert list(scheduler.take_events()) == []
+
+
+def test_request_access_events_preserve_groups_order_and_privacy():
+    scheduler = _make_request_access_scheduler(enabled=True)
+    hashes = [BlockHash(f"hash-{i}".encode()) for i in range(3)]
+    request = _add_request_access_request(
+        scheduler,
+        "private-request-id",
+        hashes,
+    )
+
+    scheduler.get_num_new_matched_tokens(request, 0)
+    events = list(scheduler.take_events())
+
+    assert [event.group_idx for event in events] == [0, 1]
+    assert all(isinstance(event, RequestAccess) for event in events)
+    assert all(event.schema_version == 2 for event in events)
+    assert all(event.engine_id == "trace-engine" for event in events)
+    assert all(event.data_parallel_rank == 0 for event in events)
+    assert all(event.request_seq == 0 for event in events)
+    assert all(event.pass_index == 0 for event in events)
+    assert all(event.lookup_performed is True for event in events)
+    assert all(event.group_count == 2 for event in events)
+    assert all(event.terminal_block_hashes == hashes for event in events)
+
+    batch = KVEventBatch(ts=1.0, events=events)
+    encoded = msgspec.msgpack.encode(batch)
+    decoded = msgspec.msgpack.decode(encoded, type=KVEventBatch)
+    assert decoded == batch
+
+    payload = msgspec.msgpack.decode(msgspec.msgpack.encode(events[0]))
+    assert set(payload) == {
+        "type",
+        "schema_version",
+        "engine_id",
+        "data_parallel_rank",
+        "request_seq",
+        "pass_index",
+        "lookup_performed",
+        "group_count",
+        "group_idx",
+        "terminal_block_hashes",
+    }
+    assert payload["type"] == "RequestAccess"
+    assert b"private-request-id" not in encoded
+
+
+def test_request_access_event_is_complete_once_and_sequence_survives_reset():
+    scheduler = _make_request_access_scheduler(enabled=True)
+    first = _add_request_access_request(
+        scheduler,
+        "first",
+        [BlockHash(b"a"), BlockHash(b"b")],
+    )
+
+    scheduler.get_num_new_matched_tokens(first, 0)
+    scheduler.get_num_new_matched_tokens(first, 0)
+    first_events = list(scheduler.take_events())
+    assert [(event.request_seq, event.group_idx) for event in first_events] == [
+        (0, 0),
+        (0, 1),
+    ]
+
+    scheduler.reset_cache()
+    scheduler.get_num_new_matched_tokens(first, 0)
+    assert list(scheduler.take_events()) == []
+
+    second = _add_request_access_request(
+        scheduler,
+        "second",
+        [BlockHash(b"c")],
+    )
+    _add_request_access_request(
+        scheduler,
+        "never-accessed",
+        [BlockHash(b"ignored")],
+    )
+    scheduler.get_num_new_matched_tokens(second, 0)
+    second_events = list(scheduler.take_events())
+    assert [(event.request_seq, event.group_idx) for event in second_events] == [
+        (1, 0),
+        (1, 1),
+    ]
+
+    skipped = _add_request_access_request(
+        scheduler,
+        "skip-reading",
+        [BlockHash(b"not-an-access")],
+    )
+    skipped.skip_reading_prefix_cache = True
+    scheduler.manager.lookup.reset_mock()
+    scheduler.get_num_new_matched_tokens(skipped, 0)
+    skipped_events = list(scheduler.take_events())
+    assert [(event.request_seq, event.group_idx) for event in skipped_events] == [
+        (2, 0),
+        (2, 1),
+    ]
+    assert all(event.lookup_performed is False for event in skipped_events)
+    scheduler.manager.lookup.assert_not_called()
+
+    third = _add_request_access_request(
+        scheduler,
+        "third",
+        [BlockHash(b"d")],
+    )
+    scheduler.get_num_new_matched_tokens(third, 0)
+    third_events = list(scheduler.take_events())
+    assert [(event.request_seq, event.group_idx) for event in third_events] == [
+        (3, 0),
+        (3, 1),
+    ]
+    assert all(event.lookup_performed is True for event in third_events)
+
+
 def test_scheduler_reports_allocation_failure(request_runner):
     runner = request_runner(
         block_size=4,
@@ -127,6 +305,145 @@ def test_scheduler_reports_allocation_failure(request_runner):
     # Two attempts: once while running (block becomes full during prefill),
     # once from finished_req_ids on the next step.
     assert reduced[_ConnectorMetricName.ALLOCATION_FAILURE] == 2
+
+
+def test_full_gpu_prefix_hit_touches_without_external_lookup():
+    group_config = SimpleNamespace(
+        group_idx=0,
+        hashes_per_chunk=1,
+        tokens_per_chunk=4,
+        sliding_window_size_in_chunks=None,
+        is_eagle_group=False,
+    )
+    config = SimpleNamespace(kv_group_configs=(group_config,))
+    request = SimpleNamespace(
+        request_id="gpu-hit",
+        kv_transfer_params=None,
+        skip_reading_prefix_cache=False,
+        num_tokens=13,
+        num_prompt_tokens=13,
+        block_hashes=[BlockHash(f"b{i}".encode()) for i in range(3)],
+    )
+    req_context = ReqContext(req_id=request.request_id)
+    req_status = RequestOffloadState(
+        config=config,
+        req=request,
+        req_context=req_context,
+        offloading_context=RequestOffloadingContext(),
+    )
+
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler.config = config
+    scheduler.manager = MagicMock(spec=OffloadingManager)
+    scheduler._req_status = {request.request_id: req_status}
+    scheduler._lookup_groups = (0,)
+    scheduler._sliding_window_groups = ()
+    scheduler._mamba_align_size = None
+    scheduler._chunks_being_loaded = set()
+    scheduler._events_tracker = MagicMock()
+    scheduler._connector_stats = MagicMock()
+    scheduler._request_access_events_enabled = False
+
+    matched_tokens, is_async = scheduler.get_num_new_matched_tokens(
+        request, num_computed_tokens=12
+    )
+
+    assert (matched_tokens, is_async) == (0, False)
+    scheduler.manager.lookup.assert_not_called()
+    scheduler.manager.touch.assert_called_once()
+    assert len(scheduler.manager.touch.call_args.args[0]) == 3
+
+
+def _make_gpu_hit_harness(store_threshold: int):
+    group_config = SimpleNamespace(
+        group_idx=0,
+        hashes_per_chunk=1,
+        tokens_per_chunk=4,
+        sliding_window_size_in_chunks=None,
+        is_eagle_group=False,
+    )
+    config = SimpleNamespace(kv_group_configs=(group_config,))
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler.config = config
+    scheduler.manager = CPUOffloadingManager(
+        num_blocks=8, store_threshold=store_threshold
+    )
+    scheduler._req_status = {}
+    scheduler._lookup_groups = (0,)
+    scheduler._sliding_window_groups = ()
+    scheduler._mamba_align_size = None
+    scheduler._chunks_being_loaded = set()
+    scheduler._events_tracker = MagicMock()
+    scheduler._connector_stats = MagicMock()
+    scheduler._request_access_events_enabled = False
+    return scheduler
+
+
+def _add_gpu_hit_request(scheduler, req_id: str, skip_reading: bool):
+    request = SimpleNamespace(
+        request_id=req_id,
+        kv_transfer_params=None,
+        skip_reading_prefix_cache=skip_reading,
+        num_tokens=13,
+        num_prompt_tokens=13,
+        block_hashes=[BlockHash(f"b{i}".encode()) for i in range(3)],
+    )
+    scheduler._req_status[req_id] = RequestOffloadState(
+        config=scheduler.config,
+        req=request,
+        req_context=_create_req_context(request),
+        offloading_context=RequestOffloadingContext(),
+    )
+    return request
+
+
+def test_full_gpu_prefix_hit_advances_store_admission():
+    """A full GPU-prefix hit never produces a store offer, so only the
+    request touch can carry that reuse into store admission: with
+    store_threshold=2 the second request seeing the same prefix is
+    admitted."""
+    scheduler = _make_gpu_hit_harness(store_threshold=2)
+
+    for req_id in ("gpu-hit-a", "gpu-hit-b"):
+        request = _add_gpu_hit_request(scheduler, req_id, skip_reading=False)
+        matched_tokens, is_async = scheduler.get_num_new_matched_tokens(
+            request, num_computed_tokens=12
+        )
+        assert (matched_tokens, is_async) == (0, False)
+
+    keys = scheduler._req_status["gpu-hit-a"].group_states[0].offload_keys
+    assert len(keys) == 3
+    counts = scheduler.manager.counts
+    assert counts is not None
+    assert all(counts[key] == 2 for key in keys)
+
+    store_output = scheduler.manager.prepare_store(
+        keys, scheduler._req_status["gpu-hit-b"].req_context
+    )
+    assert store_output is not None
+    assert store_output.keys_to_store == keys
+
+
+def test_skip_reading_request_does_not_advance_admission():
+    """skip_reading_prefix_cache deliberately forbids cache reuse: the
+    request is still touched for policy recency, but admission stays at
+    zero and a store offer for its keys is rejected."""
+    scheduler = _make_gpu_hit_harness(store_threshold=2)
+    request = _add_gpu_hit_request(scheduler, "skip-read", skip_reading=True)
+
+    matched_tokens, is_async = scheduler.get_num_new_matched_tokens(
+        request, num_computed_tokens=12
+    )
+    assert (matched_tokens, is_async) == (0, False)
+
+    assert scheduler.manager.counts == {}
+
+    keys = scheduler._req_status["skip-read"].group_states[0].offload_keys
+    store_output = scheduler.manager.prepare_store(
+        keys, scheduler._req_status["skip-read"].req_context
+    )
+    assert store_output is not None
+    assert store_output.keys_to_store == []
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])

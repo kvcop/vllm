@@ -5,7 +5,7 @@
   "_prerequisites": [
     "capture a real offload event trace (kv events) from the stand and replay it through the simulator before enabling",
     "size cpu_bytes_to_use from measured host-memory headroom; the placeholder below is not measured",
-    "single-tier only: TieringOffloadingSpec rejects store_threshold >= 2"
+    "single-tier only by choice: TieringOffloadingSpec supports store_threshold since E361, but no tiered arm has been measured"
   ],
   "kv-transfer-config": {
     "kv_connector": "OffloadingConnector",

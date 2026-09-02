@@ -92,6 +92,10 @@ class ReqContext:
     req_id: str
     kv_transfer_params: dict[str, Any] | None = None
     load_tier_filter: TierFilter = TierFilter.ALL
+    # Mirrors Request.skip_reading_prefix_cache. Such requests deliberately
+    # forbid prefix-cache reuse, so their touches must not advance
+    # store-threshold admission counting; they still refresh policy recency.
+    skip_reading_prefix_cache: bool = False
     # Per-request scratch space keyed by value type, so a tier can parse
     # kv_transfer_params once (in on_new_request) and read the result back
     # on later calls for the same request.
@@ -215,6 +219,9 @@ class OffloadingKVEventsConfig:
     # OffloadingConnector opt-in for self-describing BlockStored payloads.
     # Effective only when enable_kv_cache_events is true.
     self_describing_kv_events: bool
+    # OffloadingConnector opt-in for privacy-safe request access events.
+    # Effective only when enable_kv_cache_events is true.
+    request_access_events: bool = False
 
 
 class OffloadingManager(ABC):
@@ -587,6 +594,9 @@ class OffloadingSpec(ABC):
             enable_kv_cache_events=config.enable_kv_cache_events,
             self_describing_kv_events=bool(
                 self.extra_config.get("self_describing_kv_events", False)
+            ),
+            request_access_events=bool(
+                self.extra_config.get("request_access_events", False)
             ),
         )
 

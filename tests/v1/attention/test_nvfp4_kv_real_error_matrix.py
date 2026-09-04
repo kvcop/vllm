@@ -205,10 +205,15 @@ def test_analyze_capture_dir_clean_pass_and_corrupt_fail(tmp_path: Path) -> None
         assert layer["nvfp4_gate_pass"] is True
         assert layer["nvfp4_K_cos"] == pytest.approx(1.0, abs=1e-6)
         assert layer["nvfp4_K_rel_l2"] == pytest.approx(0.0, abs=1e-9)
-        assert layer["fp8_K_cos"] == pytest.approx(1.0, abs=1e-6)
+        # NVFP4-grid values carry ~10 mantissa bits, the e4m3 cast keeps 3,
+        # so the FP8 arm on this synthetic input sits well under the 0.13
+        # synthetic noise floor but is not bit-exact.
+        assert layer["fp8_K_cos"] >= 0.999
+        assert layer["fp8_K_rel_l2"] <= 0.05
     assert report["aggregate"]["nvfp4_gate_pass"] is True
     assert report["aggregate"]["nvfp4_fp8_rel_l2_ratio"] == pytest.approx(0.0, abs=1e-9)
-    assert report["aggregate"]["nvfp4_K_elements"] == 2 * 2 * 16 * 1 * 256
+    # Aggregate spans both layers: 2 layers x 2 ranks x 2 calls x 16x1x256.
+    assert report["aggregate"]["nvfp4_K_elements"] == 2 * 2 * 2 * 16 * 1 * 256
 
     corrupt = tmp_path / "corrupt"
     _write_capture_tree(corrupt, ranks=[0], layers=layers, calls=1, corrupt=True)

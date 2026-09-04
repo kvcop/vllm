@@ -590,10 +590,16 @@ class TritonAttentionImpl(AttentionImpl):
             )
         self.use_alibi_sqrt = use_alibi_sqrt
         self.chunk_lookback = chunk_lookback
-        self.supports_quant_query_input = current_platform.is_cuda()
 
         self._kv_quant_mode = get_kv_quant_mode(kv_cache_dtype)
         self._is_per_token_head_quant = self._kv_quant_mode.is_per_token_head
+        # E361 (review blocker): the unified kernel's NVFP4 KV loader decodes
+        # to fp16 and converts to the query dtype, so a pre-quantized FP8
+        # query would silently re-quantize the decoded K/V tiles to E4M3.
+        # NVFP4 KV therefore runs with model-dtype queries only.
+        self.supports_quant_query_input = (
+            current_platform.is_cuda() and not self._kv_quant_mode.is_nvfp4
+        )
 
         # Enable tensor descriptors for Q/K/V load/store on platforms that
         # benefit from HW 2D block reads (Intel XPU).  The dead branch
@@ -678,6 +684,12 @@ class TritonAttentionImpl(AttentionImpl):
         # head halves and the unified kernel dequantizes the [data | scales]
         # planes online.  No per-tensor descales apply.
         if self._kv_quant_mode.is_nvfp4:
+            if query.dtype.is_fp8():
+                raise ValueError(
+                    "NVFP4 KV cache received a pre-quantized FP8 query; the "
+                    "Triton NVFP4 decode path requires model-dtype queries "
+                    "(supports_quant_query_input is False for nvfp4)."
+                )
             kv_cache_t = kv_cache.transpose(1, 2)
             nkv = self.num_kv_heads
             key_cache = kv_cache_t[:, :, :nkv, : self.head_size // 2]

@@ -378,6 +378,112 @@ def test_backend_admission_surface() -> None:
         pass
 
 
+def test_nvfp4_backend_does_not_declare_quantized_query_input() -> None:
+    """E361 review blocker: no pre-quantized Q for the nvfp4 engine path.
+
+    ``vllm/model_executor/layers/attention/attention.py`` creates ``QuantFP8``
+    and converts Q to ``torch.float8_e4m3fn`` whenever
+    ``impl.supports_quant_query_input`` is set and kv_cache_dtype is fp8* or
+    nvfp4. The unified kernel's NVFP4 loader decodes K/V to fp16 and then
+    converts them to the query dtype, so an FP8 query would silently
+    re-quantize the decoded K/V tiles to E4M3: the arm would measure
+    NVFP4->fp16->FP8 K/V plus FP8 Q, not the claimed per-16 NVFP4 decode.
+    The backend therefore must not declare query quantization for nvfp4,
+    which keeps the Q arriving at ``unified_attention`` in the model dtype
+    (fp16/bf16). The fp8 path keeps its original declaration.
+    """
+    impl4 = TritonAttentionImpl(
+        num_heads=NUM_Q_HEADS,
+        head_size=HEAD_SIZE,
+        scale=SM_SCALE,
+        num_kv_heads=NUM_KV_HEADS,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="nvfp4",
+        attn_type=AttentionType.DECODER,
+    )
+    assert impl4._kv_quant_mode == KVQuantMode.NVFP4
+    assert impl4.supports_quant_query_input is False
+
+    impl8 = TritonAttentionImpl(
+        num_heads=NUM_Q_HEADS,
+        head_size=HEAD_SIZE,
+        scale=SM_SCALE,
+        num_kv_heads=NUM_KV_HEADS,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="fp8",
+        attn_type=AttentionType.DECODER,
+    )
+    assert impl8._kv_quant_mode == KVQuantMode.FP8_PER_TENSOR
+    assert impl8.supports_quant_query_input is True
+
+
+def test_nvfp4_fp8_query_double_quantization_oracle() -> None:
+    """Packed-row oracle: an FP8 query would corrupt the decoded K/V tiles.
+
+    A single-magnitude 1.6875 group (scale 1.125 x E2M1 1.5) decodes
+    exactly through the reference chain, but 1.6875 is not representable in
+    E4M3 and rounds to 1.75. Passing an FP8 query to ``unified_attention``
+    on the NVFP4 cache (the pre-fix engine behaviour) therefore matches a
+    NONE-mode cache whose K/V were pre-cast through E4M3, and differs from
+    the model-dtype query result: concrete proof that the query dtype, not
+    the NVFP4 store, caused the drift. Post-fix the engine never produces
+    that FP8 query; ``TritonAttentionImpl.forward`` additionally raises on
+    one reaching the nvfp4 branch.
+    """
+    torch.manual_seed(11)
+    num_seqs, ctx, q_len = 1, 64, 1
+    total_k = ctx + q_len
+    blocks_per_seq = (total_k + BLOCK_SIZE - 1) // BLOCK_SIZE
+    num_blocks = num_seqs * blocks_per_seq + 8
+    q = torch.randn(num_seqs * q_len, NUM_Q_HEADS, HEAD_SIZE, device=DEVICE).half()
+    k_src = torch.full((total_k, NUM_KV_HEADS, HEAD_SIZE), 1.6875, device=DEVICE).half()
+    v_src = torch.randn(total_k, NUM_KV_HEADS, HEAD_SIZE, device=DEVICE).half()
+
+    pk, sk = nvfp4_quantize_reference(k_src)
+    pv, sv = nvfp4_quantize_reference(v_src)
+    kd = nvfp4_dequantize_reference(pk, sk)
+    vd = nvfp4_dequantize_reference(pv, sv)
+    assert torch.equal(kd, k_src)
+    kd8 = kd.to(torch.float8_e4m3fn).half()
+    assert (kd8 == 1.75).all() and not torch.equal(kd8, kd)
+    vd8 = vd.to(torch.float8_e4m3fn).half()
+
+    cache4 = _make_logical_cache(num_blocks, "HND")
+    cache_bug = torch.zeros(
+        num_blocks, NUM_KV_HEADS, BLOCK_SIZE, 2 * HEAD_SIZE,
+        dtype=torch.float16, device=DEVICE,
+    )
+    t_bug = cache_bug.transpose(1, 2)
+    block_table = torch.arange(
+        num_seqs * blocks_per_seq, device=DEVICE, dtype=torch.int32
+    ).reshape(num_seqs, blocks_per_seq)
+    for i in range(total_k):
+        blk = int(block_table[0, i // BLOCK_SIZE].item())
+        off = i % BLOCK_SIZE
+        cache4[blk, :NUM_KV_HEADS, off, : HEAD_SIZE // 2] = pk[i]
+        cache4[blk, :NUM_KV_HEADS, off, HEAD_SIZE // 2 :] = sk[i].view(torch.uint8)
+        cache4[blk, NUM_KV_HEADS:, off, : HEAD_SIZE // 2] = pv[i]
+        cache4[blk, NUM_KV_HEADS:, off, HEAD_SIZE // 2 :] = sv[i].view(torch.uint8)
+        t_bug[blk, off, :, :HEAD_SIZE] = kd8[i]
+        t_bug[blk, off, :, HEAD_SIZE:] = vd8[i]
+
+    cu_q = torch.tensor([0, num_seqs * q_len], device=DEVICE, dtype=torch.int32)
+    seqused = torch.full((num_seqs,), total_k, device=DEVICE, dtype=torch.int32)
+
+    out_fp16q = _run(q, cache4, KVQuantMode.NVFP4, cu_q, seqused, block_table, q_len)
+    out_fp8q = _run(
+        q.to(torch.float8_e4m3fn), cache4, KVQuantMode.NVFP4, cu_q, seqused,
+        block_table, q_len,
+    )
+    out_bug_ref = _run(q, cache_bug, KVQuantMode.NONE, cu_q, seqused, block_table, q_len)
+
+    assert _rel_l2(out_fp8q, out_bug_ref) < 1e-4, "FP8-Q run is not the E4M3-cast cache"
+    drift = _rel_l2(out_fp8q, out_fp16q)
+    assert drift > 1e-3, f"FP8 query did not corrupt the decoded tiles: {drift:.2e}"
+
+
 if __name__ == "__main__":
     if not torch.cuda.is_available():
         print("SKIP: no CUDA device")
@@ -396,5 +502,9 @@ if __name__ == "__main__":
             print(f"FAIL test_attention_variants_vs_fp16_and_fp8[{name}]: {e}")
     test_backend_admission_surface()
     print("PASS test_backend_admission_surface")
+    test_nvfp4_backend_does_not_declare_quantized_query_input()
+    print("PASS test_nvfp4_backend_does_not_declare_quantized_query_input")
+    test_nvfp4_fp8_query_double_quantization_oracle()
+    print("PASS test_nvfp4_fp8_query_double_quantization_oracle")
     print(f"SUMMARY failed={failures}")
     sys.exit(1 if failures else 0)

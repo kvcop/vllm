@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """High-Performance Triton-only Attention layer."""
 
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -35,6 +36,10 @@ from vllm.v1.attention.backends.utils import (
     get_kv_cache_layout,
     get_num_attention_heads_from_layers,
 )
+from vllm.v1.attention.ops.nvfp4_kv_capture import (
+    CAPTURE_ENV_VAR as _NVFP4KV_CAPTURE_ENV_VAR,
+    capture_kv_snapshot as _nvfp4kv_capture_kv_snapshot,
+)
 from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
@@ -50,6 +55,9 @@ from vllm.v1.kv_cache_interface import (
 )
 
 logger = init_logger(__name__)
+# E361 real-activation capture: one env lookup at import time so the
+# per-call cost is a single bool check unless the arm opts in.
+_NVFP4KV_CAPTURE_ENABLED = bool(os.environ.get(_NVFP4KV_CAPTURE_ENV_VAR))
 
 
 # constants
@@ -837,6 +845,14 @@ class TritonAttentionImpl(AttentionImpl):
             # we use direct Q, K, V tensors without caching
             return
         # Reshape the input keys and values and store them in the cache.
+        if _NVFP4KV_CAPTURE_ENABLED and not is_quantized_kv_cache(
+            self.kv_cache_dtype
+        ):
+            # Optional pre-cache bf16 snapshot for the NVFP4-KV error matrix;
+            # no-op unless VLLM_NVFP4KV_CAPTURE_DIR is set in the environment.
+            _nvfp4kv_capture_kv_snapshot(
+                getattr(layer, "layer_name", None), key, value
+            )
         if self._kv_quant_mode.is_nvfp4:
             triton_reshape_and_cache_flash_nvfp4(
                 key,

@@ -974,6 +974,37 @@ class VllmConfig:
         ):
             return
 
+        # An explicit --kv-transfer-config reaches this check even when
+        # kv_offloading_size is None (_post_init_kv_transfer_config returns
+        # early there), so the offloading-vs-nvfp4 rejection must live here,
+        # not only inside the kv_offloading_size branch.
+        if self.cache_config.cache_dtype == "nvfp4":
+            offloading_connectors = {
+                "OffloadingConnector",
+                "SimpleCPUOffloadConnector",
+                "LMCacheConnectorV1",
+                "LMCacheMPConnector",
+            }
+            # MultiConnector children arrive as KVTransferConfig-shaped
+            # dicts under kv_connector_extra_config["connectors"].
+            configured = {self.kv_transfer_config.kv_connector}
+            for child in self.kv_transfer_config.kv_connector_extra_config.get(
+                "connectors", []
+            ):
+                configured.add(child.get("kv_connector"))
+            caught = sorted(
+                name for name in configured if name in offloading_connectors
+            )
+            if caught:
+                raise ValueError(
+                    f"CPU/offloading KV connector(s) {caught} are not "
+                    "supported with an NVFP4 KV cache: the offloading tier "
+                    "moves KV blocks through per-dtype shape assumptions "
+                    "that the packed NVFP4 layout (separate [data | scales] "
+                    "planes) does not satisfy. Remove the connector or use "
+                    "a different --kv-cache-dtype."
+                )
+
         # PyTorch's expandable_segments allocator uses CUDA VMM, which can
         # remap a virtual address range to different physical pages over the
         # engine's lifetime. KV connectors that pin KV cache memory (e.g.

@@ -52,6 +52,19 @@ _STATE: _CaptureState | None = None
 _STATE_INITIALIZED = False
 
 
+def _warn_safely(message: str) -> None:
+    """Warns without ever raising.
+
+    Under ``PYTHONWARNINGS=error`` (or a warnings-as-errors filter),
+    ``warnings.warn`` itself raises; a diagnostic instrument must not turn
+    that into a serving-path exception.
+    """
+    try:
+        warnings.warn(message, stacklevel=3)
+    except Exception:  # noqa: BLE001 - must never break serving.
+        pass
+
+
 def _resolve_rank() -> int:
     """Returns the tensor-parallel rank of this worker process.
 
@@ -81,10 +94,9 @@ def _get_state() -> _CaptureState | None:
         state.root.mkdir(parents=True, exist_ok=True)
         _STATE = state
     except Exception as error:  # noqa: BLE001 - must never break serving.
-        warnings.warn(
+        _warn_safely(
             f"{CAPTURE_ENV_VAR} is set but the K/V capture cannot start: "
-            f"{error!r}; the capture stays disabled.",
-            stacklevel=2,
+            f"{error!r}; the capture stays disabled."
         )
     return _STATE
 
@@ -117,10 +129,9 @@ def _save_call(
         )
     except Exception as error:  # noqa: BLE001 - must never break serving.
         state.disabled = True
-        warnings.warn(
+        _warn_safely(
             f"NVFP4-KV K/V capture failed on layer {layer_name!r} "
-            f"(call {call_index}) and is now disabled: {error!r}",
-            stacklevel=2,
+            f"(call {call_index}) and is now disabled: {error!r}"
         )
         return
     state.calls_by_layer[layer_name] = call_index + 1

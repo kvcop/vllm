@@ -59,6 +59,31 @@ logger = init_logger(__name__)
 # per-call cost is a single bool check unless the arm opts in.
 _NVFP4KV_CAPTURE_ENABLED = bool(os.environ.get(_NVFP4KV_CAPTURE_ENV_VAR))
 
+# torch.dtype has no is_fp8() on torch 2.11/2.13 (the upstream `.is_fp8()`
+# calls live inside triton.jit kernels, where they resolve on triton dtype
+# constexprs) — host-side checks must compare against the fp8 members.
+_FP8_QUERY_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+_NVFP4KV_CAPTURE_BARRIER_HITS = 0
+
+
+def _query_is_fp8(dtype: torch.dtype) -> bool:
+    return dtype in _FP8_QUERY_DTYPES
+
+
+def _capture_kv_snapshot_barrier(
+    layer_name: str | None, key: torch.Tensor, value: torch.Tensor
+) -> None:
+    """Final barrier around the optional capture hook: counting, never raising."""
+    global _NVFP4KV_CAPTURE_BARRIER_HITS
+    try:
+        _nvfp4kv_capture_kv_snapshot(layer_name, key, value)
+    except Exception:
+        _NVFP4KV_CAPTURE_BARRIER_HITS += 1
+        if _NVFP4KV_CAPTURE_BARRIER_HITS == 1:
+            logger.warning(
+                "nvfp4kv capture barrier suppressed an exception", exc_info=True
+            )
+
 
 # constants
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
@@ -684,7 +709,7 @@ class TritonAttentionImpl(AttentionImpl):
         # head halves and the unified kernel dequantizes the [data | scales]
         # planes online.  No per-tensor descales apply.
         if self._kv_quant_mode.is_nvfp4:
-            if query.dtype.is_fp8():
+            if _query_is_fp8(query.dtype):
                 raise ValueError(
                     "NVFP4 KV cache received a pre-quantized FP8 query; the "
                     "Triton NVFP4 decode path requires model-dtype queries "
@@ -862,7 +887,9 @@ class TritonAttentionImpl(AttentionImpl):
         ):
             # Optional pre-cache bf16 snapshot for the NVFP4-KV error matrix;
             # no-op unless VLLM_NVFP4KV_CAPTURE_DIR is set in the environment.
-            _nvfp4kv_capture_kv_snapshot(
+            # Wrapped in a counting never-raise barrier: a capture failure
+            # must never take down serving.
+            _capture_kv_snapshot_barrier(
                 getattr(layer, "layer_name", None), key, value
             )
         if self._kv_quant_mode.is_nvfp4:

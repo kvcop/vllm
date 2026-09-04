@@ -29,9 +29,11 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from vllm.v1.attention.backend import AttentionType  # noqa: E402
+from vllm.v1.attention.backends import triton_attn as ta  # noqa: E402
 from vllm.v1.attention.backends.triton_attn import (  # noqa: E402
     TritonAttentionBackend,
     TritonAttentionImpl,
+    TritonAttentionMetadata,
 )
 from vllm.v1.attention.ops.triton_nvfp4_kv import (  # noqa: E402
     nvfp4_cache_bytes_per_token,
@@ -484,6 +486,153 @@ def test_nvfp4_fp8_query_double_quantization_oracle() -> None:
     assert drift > 1e-3, f"FP8 query did not corrupt the decoded tiles: {drift:.2e}"
 
 
+def test_query_is_fp8_membership() -> None:
+    """Host-side fp8 query check must not call torch.dtype.is_fp8().
+
+    torch.dtype has no ``is_fp8`` attribute on torch 2.11 or 2.13 — the
+    upstream ``.is_fp8()`` calls live inside triton.jit kernels, where they
+    resolve on triton dtype constexprs. The a1 guard therefore raised
+    AttributeError on the first nvfp4 forward (stand boot 04.09 22:54
+    follow-up finding). Membership against the two fp8 dtypes is
+    version-proof, including for dtype-like objects without the attribute.
+    """
+    assert ta._query_is_fp8(torch.float8_e4m3fn) is True
+    assert ta._query_is_fp8(torch.float8_e5m2) is True
+    assert ta._query_is_fp8(torch.float16) is False
+    assert ta._query_is_fp8(torch.bfloat16) is False
+    # A dtype-like object whose class has no is_fp8 (torch 2.11/2.13
+    # torch.dtype) must be classified, not attribute-errored.
+    assert ta._query_is_fp8(type("Plain", (), {})()) is False
+
+
+def _make_forward_metadata(
+    cu_q: torch.Tensor,
+    seqused: torch.Tensor,
+    block_table: torch.Tensor,
+    q_len: int,
+    total_q: int,
+) -> TritonAttentionMetadata:
+    """Minimal DECODER metadata for the 2D decode path of forward()."""
+    return TritonAttentionMetadata(
+        num_actual_tokens=total_q,
+        max_query_len=q_len,
+        query_start_loc=cu_q,
+        max_seq_len=int(seqused.max()),
+        seq_lens=seqused,
+        block_table=block_table,
+        slot_mapping=torch.zeros(total_q, dtype=torch.int32, device=DEVICE),
+        seq_threshold_3D=4096,
+        num_par_softmax_segments=1,
+        softmax_segm_output=None,
+        softmax_segm_max=None,
+        softmax_segm_expsum=None,
+        causal=True,
+        use_cascade=False,
+        common_prefix_len=0,
+        cu_prefix_query_lens=None,
+        prefix_kv_lens=None,
+        suffix_kv_lens=None,
+    )
+
+
+def _forward_case(query_dtype: torch.dtype):
+    """Shared setup: impl + filled nvfp4 cache + metadata for forward()."""
+    torch.manual_seed(17)
+    num_seqs, ctx, q_len = 2, 128, 1
+    (q, cu_q, seqused, bt, max_q, c16, c16d, c4, c8, descales) = _build_case(
+        num_seqs, ctx, q_len, seed=17
+    )
+    impl = TritonAttentionImpl(
+        num_heads=NUM_Q_HEADS,
+        head_size=HEAD_SIZE,
+        scale=SM_SCALE,
+        num_kv_heads=NUM_KV_HEADS,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="nvfp4",
+        attn_type=AttentionType.DECODER,
+    )
+    total_q = num_seqs * q_len
+    # DECODER forward ignores the new-token projections (they were stored by
+    # do_kv_cache_update); pass correctly-shaped dummies.
+    k_dummy = torch.zeros(total_q, NUM_KV_HEADS, HEAD_SIZE, dtype=query_dtype, device=DEVICE)
+    v_dummy = torch.zeros_like(k_dummy)
+    md = _make_forward_metadata(cu_q, seqused, bt, q_len, total_q)
+    return impl, q.to(query_dtype), k_dummy, v_dummy, c4, md, total_q
+
+
+def test_nvfp4_forward_accepts_model_dtype_query(query_dtype_name: str) -> None:
+    """Through TritonAttentionImpl.forward: fp16/bf16 queries complete (a2).
+
+    On a1 every model-dtype forward died with AttributeError at the
+    ``query.dtype.is_fp8()`` guard; the a2 membership check lets the engine
+    path run. bf16 is the stand's model dtype, fp16 the laptop harness one.
+    """
+    query_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[query_dtype_name]
+    impl, q, k, v, cache4, md, total_q = _forward_case(query_dtype)
+    output = torch.empty(total_q, NUM_Q_HEADS, HEAD_SIZE, dtype=query_dtype, device=DEVICE)
+
+    impl.forward(
+        torch.nn.Module(), q, k, v, cache4, md, output
+    )
+
+    assert torch.isfinite(output.float()).all()
+    assert output.float().abs().max() > 0
+
+
+def test_nvfp4_forward_rejects_fp8_query() -> None:
+    """Through TritonAttentionImpl.forward: an FP8 query raises ValueError.
+
+    On a1 the same call died with AttributeError (missing is_fp8 on the
+    torch dtype) instead of the intended fail-closed ValueError.
+    """
+    impl, q, k, v, cache4, md, total_q = _forward_case(torch.float8_e4m3fn)
+    output = torch.empty(total_q, NUM_Q_HEADS, HEAD_SIZE, dtype=torch.float16, device=DEVICE)
+
+    raised = ""
+    try:
+        impl.forward(torch.nn.Module(), q, k, v, cache4, md, output)
+    except ValueError as error:
+        raised = str(error)
+    assert "pre-quantized FP8 query" in raised, (
+        f"forward must fail closed on an FP8 query, got: {raised!r}"
+    )
+
+
+def test_capture_barrier_swallows_hook_failures() -> None:
+    """Call-site capture barrier: counting, never raising, warnings-safe.
+
+    The hook itself never raises by contract, but the final barrier must
+    hold even when that contract is broken — including under a
+    warnings-as-errors filter, where warnings.warn inside the hook's except
+    blocks raises instead of printing (PYTHONWARNINGS=error).
+    """
+    import warnings
+
+    calls: list[str] = []
+
+    def _boom(layer_name, key, value):
+        calls.append(layer_name)
+        warnings.warn("capture path failed", stacklevel=2)
+
+    host = torch.zeros(2, NUM_KV_HEADS, HEAD_SIZE, dtype=torch.float16)
+    saved_hook = ta._nvfp4kv_capture_kv_snapshot
+    saved_hits = ta._NVFP4KV_CAPTURE_BARRIER_HITS
+    ta._nvfp4kv_capture_kv_snapshot = _boom
+    ta._NVFP4KV_CAPTURE_BARRIER_HITS = 0
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            ta._capture_kv_snapshot_barrier("layer0", host, host)
+            ta._capture_kv_snapshot_barrier("layer1", host, host)
+        assert calls == ["layer0", "layer1"]
+        assert ta._NVFP4KV_CAPTURE_BARRIER_HITS == 2
+    finally:
+        ta._nvfp4kv_capture_kv_snapshot = saved_hook
+        ta._NVFP4KV_CAPTURE_BARRIER_HITS = saved_hits
+
+
+
 if __name__ == "__main__":
     if not torch.cuda.is_available():
         print("SKIP: no CUDA device")
@@ -506,5 +655,14 @@ if __name__ == "__main__":
     print("PASS test_nvfp4_backend_does_not_declare_quantized_query_input")
     test_nvfp4_fp8_query_double_quantization_oracle()
     print("PASS test_nvfp4_fp8_query_double_quantization_oracle")
+    test_query_is_fp8_membership()
+    print("PASS test_query_is_fp8_membership")
+    for name in ("fp16", "bf16"):
+        test_nvfp4_forward_accepts_model_dtype_query(name)
+        print(f"PASS test_nvfp4_forward_accepts_model_dtype_query[{name}]")
+    test_nvfp4_forward_rejects_fp8_query()
+    print("PASS test_nvfp4_forward_rejects_fp8_query")
+    test_capture_barrier_swallows_hook_failures()
+    print("PASS test_capture_barrier_swallows_hook_failures")
     print(f"SUMMARY failed={failures}")
     sys.exit(1 if failures else 0)

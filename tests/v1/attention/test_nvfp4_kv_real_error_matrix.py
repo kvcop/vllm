@@ -19,10 +19,15 @@ Run standalone or via pytest inside an env with torch and the fork's
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
-import pytest
+try:
+    import pytest
+except ImportError:  # torch-only harness (e234 venv): standalone subset only.
+    pytest = None
+
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -190,6 +195,64 @@ def _write_capture_tree(
                 )
 
 
+def test_capture_module_survives_warnings_as_errors(tmp_path: Path) -> None:
+    """PYTHONWARNINGS=error must not turn hook diagnostics into exceptions.
+
+    Under a warnings-as-errors setting, ``warnings.warn`` inside the
+    module's except blocks raises instead of printing; the never-raise
+    contract has to hold anyway (a2): ``_warn_safely`` swallows the raised
+    Warning, the capture disables itself, and serving continues. Verified
+    in a subprocess with the real PYTHONWARNINGS=error environment
+    variable; imports run under the default filter so unrelated library
+    warnings at import time do not mask the behaviour under test.
+    """
+    import subprocess
+
+    good_dir = tmp_path / "good-capture"
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+    driver = (
+        "import os, sys, warnings\n"
+        "from pathlib import Path\n"
+        "with warnings.catch_warnings():\n"
+        "    warnings.simplefilter('default')\n"
+        "    import torch\n"
+        "    from vllm.v1.attention.ops import nvfp4_kv_capture\n"
+        "warnings.simplefilter('error')\n"
+        "mode, raw = sys.argv[1], sys.argv[2]\n"
+        "root = Path(raw)\n"
+        "os.environ[nvfp4_kv_capture.CAPTURE_ENV_VAR] = raw\n"
+        "k = torch.randn(4, 2, 256, dtype=torch.float16)\n"
+        "v = torch.randn(4, 2, 256, dtype=torch.float16)\n"
+        "nvfp4_kv_capture.capture_kv_snapshot('layer0', k, v)\n"
+        "nvfp4_kv_capture.capture_kv_snapshot('layer0', k, v)\n"
+        "if mode == 'good':\n"
+        "    out = root / 'rank0' / 'layer0' / 'call0.pt'\n"
+        "    assert out.is_file(), out\n"
+    )
+
+    # Blocked root: mkdir fails -> warn path -> must not raise.
+    blocked = subprocess.run(
+        [sys.executable, "-c", driver, "blocked", str(blocker)],
+        env={**os.environ, "PYTHONWARNINGS": "error"},
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert blocked.returncode == 0, blocked.stderr[-2000:]
+
+    # Healthy root: captures land on disk even under the filter.
+    healthy = subprocess.run(
+        [sys.executable, "-c", driver, "good", str(good_dir)],
+        env={**os.environ, "PYTHONWARNINGS": "error"},
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert healthy.returncode == 0, healthy.stderr[-2000:]
+    assert (good_dir / "rank0" / "layer0" / "call0.pt").is_file()
+
+
 def test_analyze_capture_dir_clean_pass_and_corrupt_fail(tmp_path: Path) -> None:
     """Grid-exact captures pass the gate; noisy ones fail with layer names."""
     layers = ["model.layers.0.self_attn", "model.layers.3.self_attn"]
@@ -242,4 +305,13 @@ def test_analyze_capture_dir_respects_max_calls(tmp_path: Path) -> None:
 
 
 if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-q"]))
+    # The warnings-as-errors subprocess test also runs without pytest;
+    # the fixture-based cases need it, so fall back to pytest.main.
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        test_capture_module_survives_warnings_as_errors(Path(tmp))
+    print("PASS test_capture_module_survives_warnings_as_errors")
+    if pytest is not None:
+        raise SystemExit(pytest.main([__file__, "-q"]))
+

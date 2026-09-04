@@ -111,7 +111,11 @@ def capture_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 def test_capture_module_layout_and_call_bound(capture_env: Path) -> None:
-    """Snapshots land under rank0/<layer>/call<i>.pt, bounded per layer."""
+    """Snapshots land under rank0/<layer>/call<i>.pt, bounded per layer.
+
+    The barrier flow is stage+flush per call: the flush writes the .pt and
+    only ever runs outside CUDA graph capture.
+    """
     torch.manual_seed(3)
     layer = "model.layers.3.self_attn"
     key = torch.randn(32, 4, 256).bfloat16()
@@ -119,6 +123,7 @@ def test_capture_module_layout_and_call_bound(capture_env: Path) -> None:
     beyond = nvfp4_kv_capture.MAX_CALLS_PER_LAYER + 8
     for _ in range(beyond):
         nvfp4_kv_capture.capture_kv_snapshot(layer, key, value)
+        nvfp4_kv_capture.capture_kv_flush()
     layer_dir = capture_env / "rank0" / layer
     files = sorted(layer_dir.glob("call*.pt"))
     assert len(files) == nvfp4_kv_capture.MAX_CALLS_PER_LAYER
@@ -129,6 +134,12 @@ def test_capture_module_layout_and_call_bound(capture_env: Path) -> None:
     assert snapshot["kv_cache_dtype"] == "bfloat16"
     assert snapshot["key"].shape[1] == snapshot["num_kv_heads"] == 4
     assert snapshot["key"].shape[2] == snapshot["head_dim"] == 256
+    # Fresh-evidence markers (stand blocker 05.09): monotonic step + wall time.
+    assert snapshot["step"] == 1
+    assert snapshot["wall_time_ns"] > 0
+    later = torch.load(files[1], map_location="cpu", weights_only=True)
+    assert later["step"] == snapshot["step"] + 1
+    assert later["wall_time_ns"] >= snapshot["wall_time_ns"]
 
 
 def test_capture_module_inert_without_env(
@@ -147,21 +158,99 @@ def test_capture_module_inert_without_env(
 
 
 def test_capture_module_never_raises(capture_env: Path) -> None:
-    """Bad shapes are skipped; an unwritable root disables, not raises."""
+    """Bad shapes are skipped; an unwritable root never raises.
+
+    Since the capture-time hardening (stand blocker 05.09) a flush failure
+    disables the hook only after CONSECUTIVE_ERROR_LIMIT consecutive
+    non-capture failures, not on the first one.
+    """
     nvfp4_kv_capture.capture_kv_snapshot(
         "bad.shape", torch.randn(4, 256).bfloat16(), torch.randn(4, 256).bfloat16()
     )
+    nvfp4_kv_capture.capture_kv_flush()
     assert not (capture_env / "rank0" / "bad.shape").exists()
     blocker = capture_env / "blocker"
     blocker.write_text("not a directory")
     nvfp4_kv_capture._STATE.root = blocker
+    state = nvfp4_kv_capture._STATE
+    assert state is not None
+    for _ in range(nvfp4_kv_capture.CONSECUTIVE_ERROR_LIMIT - 1):
+        nvfp4_kv_capture.capture_kv_snapshot(
+            "blocked.layer",
+            torch.randn(4, 4, 256).bfloat16(),
+            torch.randn(4, 4, 256).bfloat16(),
+        )
+        nvfp4_kv_capture.capture_kv_flush()
+    assert not state.disabled, "one-off flush failures must not disable the hook"
     nvfp4_kv_capture.capture_kv_snapshot(
         "blocked.layer",
         torch.randn(4, 4, 256).bfloat16(),
         torch.randn(4, 4, 256).bfloat16(),
     )
+    nvfp4_kv_capture.capture_kv_flush()
+    assert state.disabled
+
+
+def _force_capturing(module, capturing: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(module, "_is_cuda_graph_capturing", lambda *a, **k: capturing)
+
+
+def test_capture_noop_during_cuda_graph_capture(
+    capture_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Graph-capture windows are a counted no-op: no staging, no flush."""
+    _force_capturing(nvfp4_kv_capture, True, monkeypatch)
+    nvfp4_kv_capture.capture_kv_snapshot(
+        "cap.layer",
+        torch.randn(4, 4, 256).bfloat16(),
+        torch.randn(4, 4, 256).bfloat16(),
+    )
+    nvfp4_kv_capture.capture_kv_flush()
+    assert not any(capture_env.rglob("call*.pt"))
     state = nvfp4_kv_capture._STATE
-    assert state is not None and state.disabled
+    assert state is not None
+    assert state.capture_skips == 1
+    assert state.pending == []
+    assert not state.disabled
+
+
+def test_capture_failure_during_capture_does_not_disable(
+    capture_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failure while capture is in flight counts, never disables."""
+    _force_capturing(nvfp4_kv_capture, True, monkeypatch)
+    state = nvfp4_kv_capture._get_state()
+    assert state is not None
+    for _ in range(3 * nvfp4_kv_capture.CONSECUTIVE_ERROR_LIMIT):
+        nvfp4_kv_capture._count_failure(state, "cap.layer", RuntimeError("capture-time"))
+    assert not state.disabled
+    assert state.capture_skips == 3 * nvfp4_kv_capture.CONSECUTIVE_ERROR_LIMIT
+    assert state.consecutive_errors == 0
+
+
+def test_capture_flush_defers_until_outside_capture(
+    capture_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Staged snapshot survives a capturing flush and lands on the next one."""
+    layer = "defer.layer"
+    key = torch.randn(4, 4, 256).bfloat16()
+    value = torch.randn(4, 4, 256).bfloat16()
+    _force_capturing(nvfp4_kv_capture, False, monkeypatch)
+    nvfp4_kv_capture.capture_kv_snapshot(layer, key, value)
+    state = nvfp4_kv_capture._STATE
+    assert state is not None and len(state.pending) == 1
+    _force_capturing(nvfp4_kv_capture, True, monkeypatch)
+    nvfp4_kv_capture.capture_kv_flush()
+    assert len(state.pending) == 1
+    assert not any(capture_env.rglob("call*.pt"))
+    _force_capturing(nvfp4_kv_capture, False, monkeypatch)
+    nvfp4_kv_capture.capture_kv_flush()
+    files = sorted((capture_env / "rank0" / layer).glob("call*.pt"))
+    assert len(files) == 1
+    snapshot = torch.load(files[0], map_location="cpu", weights_only=True)
+    assert snapshot["step"] == 1
+    assert snapshot["wall_time_ns"] > 0
+    assert state.pending == []
 
 
 def _write_capture_tree(
@@ -201,7 +290,8 @@ def test_capture_module_survives_warnings_as_errors(tmp_path: Path) -> None:
     Under a warnings-as-errors setting, ``warnings.warn`` inside the
     module's except blocks raises instead of printing; the never-raise
     contract has to hold anyway (a2): ``_warn_safely`` swallows the raised
-    Warning, the capture disables itself, and serving continues. Verified
+    Warning, flush failures only count toward the consecutive-error limit,
+    and serving continues. Verified
     in a subprocess with the real PYTHONWARNINGS=error environment
     variable; imports run under the default filter so unrelated library
     warnings at import time do not mask the behaviour under test.
@@ -226,6 +316,7 @@ def test_capture_module_survives_warnings_as_errors(tmp_path: Path) -> None:
         "v = torch.randn(4, 2, 256, dtype=torch.float16)\n"
         "nvfp4_kv_capture.capture_kv_snapshot('layer0', k, v)\n"
         "nvfp4_kv_capture.capture_kv_snapshot('layer0', k, v)\n"
+        "nvfp4_kv_capture.capture_kv_flush()\n"
         "if mode == 'good':\n"
         "    out = root / 'rank0' / 'layer0' / 'call0.pt'\n"
         "    assert out.is_file(), out\n"

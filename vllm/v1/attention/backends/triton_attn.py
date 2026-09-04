@@ -38,6 +38,7 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.attention.ops.nvfp4_kv_capture import (
     CAPTURE_ENV_VAR as _NVFP4KV_CAPTURE_ENV_VAR,
+    capture_kv_flush as _nvfp4kv_capture_kv_flush,
     capture_kv_snapshot as _nvfp4kv_capture_kv_snapshot,
 )
 from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
@@ -77,6 +78,8 @@ def _capture_kv_snapshot_barrier(
     global _NVFP4KV_CAPTURE_BARRIER_HITS
     try:
         _nvfp4kv_capture_kv_snapshot(layer_name, key, value)
+        # Host-side .pt flush; the hook itself is a no-op during graph capture.
+        _nvfp4kv_capture_kv_flush()
     except Exception:
         _NVFP4KV_CAPTURE_BARRIER_HITS += 1
         if _NVFP4KV_CAPTURE_BARRIER_HITS == 1:

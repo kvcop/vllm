@@ -767,6 +767,22 @@ class TritonAttentionImpl(AttentionImpl):
         softmax_segm_max = attn_metadata.softmax_segm_max
         softmax_segm_expsum = attn_metadata.softmax_segm_expsum
 
+        if self._kv_quant_mode.is_nvfp4:
+            # E361 correctness fix (stand audit 05.09): with segment buffers
+            # allocated the wrapper takes the 3D segmented softmax path for
+            # every decode call (max_seqlen_q == 1, num_seqs <= threshold),
+            # and that path returns uncorrelated output for NVFP4 KV
+            # (rel_l2 ~1.0-1.7 vs a reference over the decoded planes,
+            # bit-reproduced standalone on the exact engine arguments; the
+            # fp8 arms are coherent on the same 3D path).  The non-segmented
+            # path is exact (2.3e-4).  Disable the segmented path for NVFP4
+            # until the 3D NVFP4 tile walk is root-caused.
+            seq_threshold_3D = None
+            num_par_softmax_segments = None
+            softmax_segm_output = None
+            softmax_segm_max = None
+            softmax_segm_expsum = None
+
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
         unified_attention(

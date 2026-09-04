@@ -25,6 +25,7 @@ import sys
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
@@ -599,6 +600,102 @@ def test_nvfp4_forward_rejects_fp8_query() -> None:
     )
 
 
+def test_nvfp4_forward_decode_segmented_metadata_matches_reference() -> None:
+    """Engine-shaped decode call must not take the segmented softmax path.
+
+    The metadata builder always allocates the softmax segment buffers, and
+    every ``max_query_len == 1`` call below the 2D launch threshold
+    (``use_3d`` in ``unified_attention``) takes the 3D segmented kernel.
+    With NVFP4 KV that path returned uncorrelated output (stand engine
+    audit 05.09: rel_l2 1.01 vs the decoded-plane reference, bit-reproduced
+    standalone on the exact engine arguments), while the same tensors on
+    the non-segmented path are exact (2.3e-4).  The impl must therefore pin
+    the non-segmented path for NVFP4 KV.
+    """
+    torch.manual_seed(23)
+    num_seqs, ctx, q_len = 2, 40, 1
+    (q, cu_q, seqused, block_table, _, _, _, c4, _, _) = _build_case(
+        num_seqs, ctx, q_len, seed=23
+    )
+    total_q = num_seqs * q_len
+    nkv, nq, hs = NUM_KV_HEADS, NUM_Q_HEADS, HEAD_SIZE
+    thr, nseg = 16, 16
+    md = TritonAttentionMetadata(
+        num_actual_tokens=total_q,
+        max_query_len=q_len,
+        query_start_loc=cu_q,
+        max_seq_len=int(seqused.max()),
+        seq_lens=seqused,
+        block_table=block_table,
+        slot_mapping=torch.zeros(total_q, dtype=torch.int32, device=DEVICE),
+        seq_threshold_3D=thr,
+        num_par_softmax_segments=nseg,
+        softmax_segm_output=torch.empty(
+            thr, nq, nseg, hs, dtype=torch.float32, device=DEVICE
+        ),
+        softmax_segm_max=torch.empty(thr, nq, nseg, dtype=torch.float32, device=DEVICE),
+        softmax_segm_expsum=torch.empty(
+            thr, nq, nseg, dtype=torch.float32, device=DEVICE
+        ),
+        causal=True,
+        use_cascade=False,
+        common_prefix_len=0,
+        cu_prefix_query_lens=None,
+        prefix_kv_lens=None,
+        suffix_kv_lens=None,
+    )
+    impl = TritonAttentionImpl(
+        num_heads=nq,
+        head_size=hs,
+        scale=SM_SCALE,
+        num_kv_heads=nkv,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="nvfp4",
+        attn_type=AttentionType.DECODER,
+    )
+    qq = q.to(torch.float16)
+    out = torch.empty_like(qq)
+    k_dummy = torch.zeros(total_q, nkv, hs, dtype=qq.dtype, device=DEVICE)
+    impl.forward(torch.nn.Module(), qq, k_dummy, k_dummy.clone(), c4, md, out)
+
+    bs = c4.shape[2]
+    total_k = ctx + q_len
+    k_rows, v_rows = [], []
+    for s in range(num_seqs):
+        for i in range(total_k):
+            blk = int(block_table[s, i // bs].item())
+            off = i % BLOCK_SIZE
+            k_rows.append(c4[blk, :nkv, off])
+            v_rows.append(c4[blk, nkv:, off])
+
+    def _decode(rows):
+        data = rows[..., : hs // 2]
+        scales = rows[..., hs // 2 :].contiguous().view(torch.float8_e4m3fn)
+        return nvfp4_dequantize_reference(data, scales).float()
+
+    kd = _decode(torch.stack(k_rows))
+    vd = _decode(torch.stack(v_rows))
+    rep = nq // nkv
+    refs = []
+    for s in range(num_seqs):
+        kk = kd[s * total_k : (s + 1) * total_k].repeat_interleave(rep, dim=1)
+        vv = vd[s * total_k : (s + 1) * total_k].repeat_interleave(rep, dim=1)
+        # q_len == 1: every K slot is visible (position total_k - 1).
+        refs.append(
+            F.scaled_dot_product_attention(
+                qq[s : s + 1].float().transpose(0, 1)[None],
+                kk.transpose(0, 1)[None],
+                vv.transpose(0, 1)[None],
+                scale=SM_SCALE,
+            )[0].transpose(0, 1)
+        )
+    ref = torch.cat(refs, dim=0)
+    assert _rel_l2(out.float(), ref) < 5e-3, (
+        f"segmented decode metadata diverged from reference: {_rel_l2(out.float(), ref):.6f}"
+    )
+
+
 def test_capture_barrier_swallows_hook_failures() -> None:
     """Call-site capture barrier: counting, never raising, warnings-safe.
 
@@ -662,6 +759,8 @@ if __name__ == "__main__":
         print(f"PASS test_nvfp4_forward_accepts_model_dtype_query[{name}]")
     test_nvfp4_forward_rejects_fp8_query()
     print("PASS test_nvfp4_forward_rejects_fp8_query")
+    test_nvfp4_forward_decode_segmented_metadata_matches_reference()
+    print("PASS test_nvfp4_forward_decode_segmented_metadata_matches_reference")
     test_capture_barrier_swallows_hook_failures()
     print("PASS test_capture_barrier_swallows_hook_failures")
     print(f"SUMMARY failed={failures}")

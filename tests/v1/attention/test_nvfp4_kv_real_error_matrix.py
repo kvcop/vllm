@@ -314,4 +314,3 @@ if __name__ == "__main__":
     print("PASS test_capture_module_survives_warnings_as_errors")
     if pytest is not None:
         raise SystemExit(pytest.main([__file__, "-q"]))
-

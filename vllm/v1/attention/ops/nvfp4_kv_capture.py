@@ -218,18 +218,35 @@ def _flush_pending(state: _CaptureState) -> None:
             value_cpu = snapshot.value.to(device="cpu", dtype=torch.bfloat16)
             layer_dir = state.root / f"rank{state.rank}" / layer_name
             layer_dir.mkdir(parents=True, exist_ok=True)
-            torch.save(
-                {
-                    "key": key_cpu,
-                    "value": value_cpu,
-                    "num_kv_heads": snapshot.key.shape[1],
-                    "head_dim": snapshot.key.shape[2],
-                    "kv_cache_dtype": "bfloat16",
-                    "step": snapshot.step,
-                    "wall_time_ns": time.time_ns(),
-                },
-                layer_dir / f"call{call_index}.pt",
-            )
+            target = layer_dir / f"call{call_index}.pt"
+            # Atomic write (05.09 attempt 3): readers (stand preflight) must
+            # never observe a half-written .pt. Payload goes to <name>.pt.tmp,
+            # fsync makes the bytes durable, os.replace swaps atomically.
+            tmp_path = layer_dir / f"call{call_index}.pt.tmp"
+            try:
+                with tmp_path.open("wb") as handle:
+                    torch.save(
+                        {
+                            "key": key_cpu,
+                            "value": value_cpu,
+                            "num_kv_heads": snapshot.key.shape[1],
+                            "head_dim": snapshot.key.shape[2],
+                            "kv_cache_dtype": "bfloat16",
+                            "step": snapshot.step,
+                            "wall_time_ns": time.time_ns(),
+                        },
+                        handle,
+                    )
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(tmp_path, target)
+            finally:
+                # A crashed flush may leave the .tmp behind; acceptance
+                # ignores *.tmp, so unlinking is best-effort hygiene only.
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
         except Exception as error:  # noqa: BLE001 - must never break serving.
             _count_failure(state, layer_name, error)
             continue
